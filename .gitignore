@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+*.exe
+*.dll
+
+# CUDA compiled intermediates & profiler captures
+*.ptx
+*.cubin
+*.fatbin
+*.nsys-rep
+*.sqlite
+*.ncu-rep
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
