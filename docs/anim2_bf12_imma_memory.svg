@@ -1,0 +1,215 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 520" width="860" height="520">
+  <defs>
+    <style>
+      .bg { fill: #171717; }
+      .title { fill: #f3f4f6; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 16px; font-weight: 700; }
+      .sub { fill: #9ca3af; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 12.5px; }
+      .metric { fill: #9ca3af; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+      .rowlbl { fill: #9ca3af; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 12px; text-anchor: end; }
+      .frlbl { fill: #9ca3af; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 12px; text-anchor: middle; }
+      .bt { fill: #f9fafb; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 12px; font-weight: 600; text-anchor: middle; }
+      .bs { fill: #d1d5db; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10.5px; text-anchor: middle; }
+      .outt { fill: #34d399; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; font-weight: 700; text-anchor: middle; }
+      .coret { fill: #f3f4f6; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 13px; font-weight: 600; text-anchor: middle; }
+      .cores { fill: #6ee7b7; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; text-anchor: middle; }
+      .pill-em { fill: #248a6b; stroke: #34d399; stroke-width: 1; }
+      .pill-or { fill: #c46835; stroke: #fb923c; stroke-width: 1; }
+      .pill-in { fill: #5e56c8; stroke: #818cf8; stroke-width: 1; }
+      .pill-dk { fill: #26262a; stroke: #404048; stroke-width: 1; }
+      .arr { fill: none; stroke: #6b7280; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+      .ruler { fill: none; stroke: #404048; stroke-width: 1; }
+
+      /* Progressive 4-stage illumination over 7.2s loop */
+      @keyframes s0 {
+        0%, 3%   { opacity: 0.22; }
+        7%, 88%  { opacity: 1; }
+        94%, 100%{ opacity: 0.22; }
+      }
+      @keyframes s1 {
+        0%, 24%  { opacity: 0.22; }
+        28%, 88% { opacity: 1; }
+        94%, 100%{ opacity: 0.22; }
+      }
+      @keyframes s2 {
+        0%, 46%  { opacity: 0.22; }
+        50%, 88% { opacity: 1; }
+        94%, 100%{ opacity: 0.22; }
+      }
+      @keyframes s3 {
+        0%, 68%  { opacity: 0.22; }
+        72%, 88% { opacity: 1; }
+        94%, 100%{ opacity: 0.22; }
+      }
+      .c0 { animation: s0 7.2s ease-in-out infinite; }
+      .c1 { animation: s1 7.2s ease-in-out infinite; }
+      .c2 { animation: s2 7.2s ease-in-out infinite; }
+      .c3 { animation: s3 7.2s ease-in-out infinite; }
+
+      /* Glowing packet dots rising along each stage */
+      @keyframes p0 {
+        0%, 4%   { transform: translateY(0px); opacity: 0; }
+        7%       { transform: translateY(0px); opacity: 1; }
+        23%      { transform: translateY(-285px); opacity: 1; }
+        26%, 100%{ transform: translateY(-285px); opacity: 0; }
+      }
+      @keyframes p1 {
+        0%, 25%  { transform: translateY(0px); opacity: 0; }
+        28%      { transform: translateY(0px); opacity: 1; }
+        45%      { transform: translateY(-285px); opacity: 1; }
+        48%, 100%{ transform: translateY(-285px); opacity: 0; }
+      }
+      @keyframes p2 {
+        0%, 47%  { transform: translateY(0px); opacity: 0; }
+        50%      { transform: translateY(0px); opacity: 1; }
+        67%      { transform: translateY(-285px); opacity: 1; }
+        70%, 100%{ transform: translateY(-285px); opacity: 0; }
+      }
+      @keyframes p3 {
+        0%, 69%  { transform: translateY(0px); opacity: 0; }
+        72%      { transform: translateY(0px); opacity: 1; }
+        87%      { transform: translateY(-285px); opacity: 1; }
+        90%, 100%{ transform: translateY(-285px); opacity: 0; }
+      }
+      .dot0 { animation: p0 7.2s linear infinite; }
+      .dot1 { animation: p1 7.2s linear infinite; }
+      .dot2 { animation: p2 7.2s linear infinite; }
+      .dot3 { animation: p3 7.2s linear infinite; }
+
+      /* Sliding highlight inside the spanning GPU bar (width 740 / 4 = 185px) */
+      @keyframes gpuSlide {
+        0%, 23%  { transform: translateX(0px); }
+        27%, 45% { transform: translateX(185px); }
+        49%, 67% { transform: translateX(370px); }
+        71%, 91% { transform: translateX(555px); }
+        95%, 100%{ transform: translateX(0px); }
+      }
+      .hi-gpu { animation: gpuSlide 7.2s ease-in-out infinite; }
+    </style>
+    <clipPath id="gpuClip">
+      <rect x="92" y="294" width="740" height="54" rx="10" />
+    </clipPath>
+  </defs>
+
+  <!-- Card Background -->
+  <rect class="bg" x="0" y="0" width="860" height="520" rx="14" />
+
+  <!-- Header -->
+  <text x="28" y="36" class="title">Fast-Serve Memory &amp; Tensor Core Engine</text>
+  <text x="832" y="36" class="metric" text-anchor="end">595.1 tok/s (B=8) · 8,109 tok/s Prefill</text>
+  <text x="28" y="57" class="sub">Lossless BF12 (-25% DRAM) + Persistent Coalesced PTX MMA (B=8) + 1-Pass Exact-Warp IMMA-128 (Prefill)</text>
+
+  <!-- Row Labels -->
+  <text x="76" y="101" class="rowlbl">result</text>
+  <text x="76" y="158" class="rowlbl">output</text>
+  <text x="76" y="236" class="rowlbl">kernel</text>
+  <text x="76" y="325" class="rowlbl">gpu</text>
+  <text x="76" y="408" class="rowlbl">weights</text>
+
+  <!-- Static Arrows (4 column centers: 184, 369, 554, 739) -->
+  <g opacity="0.55">
+    <path class="arr" d="M184 130 V112 M180 117 L184 112 L188 117" />
+    <path class="arr" d="M184 208 V184 M180 189 L184 184 L188 189" />
+    <path class="arr" d="M184 292 V264 M180 269 L184 264 L188 269" />
+    <path class="arr" d="M184 378 V352 M180 357 L184 352 L188 357" />
+
+    <path class="arr" d="M369 130 V112 M365 117 L369 112 L373 117" />
+    <path class="arr" d="M369 208 V184 M365 189 L369 184 L373 189" />
+    <path class="arr" d="M369 292 V264 M365 269 L369 264 L373 269" />
+    <path class="arr" d="M369 378 V352 M365 357 L369 352 L373 357" />
+
+    <path class="arr" d="M554 130 V112 M550 117 L554 112 L558 117" />
+    <path class="arr" d="M554 208 V184 M550 189 L554 184 L558 189" />
+    <path class="arr" d="M554 292 V264 M550 269 L554 264 L558 269" />
+    <path class="arr" d="M554 378 V352 M550 357 L554 352 L558 357" />
+
+    <path class="arr" d="M739 130 V112 M735 117 L739 112 L743 117" />
+    <path class="arr" d="M739 208 V184 M735 189 L739 184 L743 189" />
+    <path class="arr" d="M739 292 V264 M735 269 L739 264 L743 269" />
+    <path class="arr" d="M739 378 V352 M735 357 L739 352 L743 357" />
+  </g>
+
+  <!-- SPANNING GPU BAR -->
+  <rect class="pill-dk" x="92" y="294" width="740" height="54" rx="10" />
+  <g clip-path="url(#gpuClip)">
+    <rect class="hi-gpu" x="92" y="294" width="185" height="54" fill="#10b981" fill-opacity="0.20" />
+  </g>
+  <text x="462" y="317" class="coret">NVIDIA GeForce RTX 3080 (68 Ampere SMs · 760 GB/s GDDR6X) · Native sm_86 CUBIN</text>
+  <text x="462" y="335" class="cores">High-Priority CUDA Stream (-48 ms WDDM stalls) · Strictly 0 Bytes Register Spill on all 118 Kernels</text>
+
+  <!-- STAGE 0: Lossless BF12 + CS6 Compression -->
+  <g class="c0">
+    <text x="184" y="101" class="outt">-2.05 GB VRAM</text>
+    <rect class="pill-em" x="102" y="132" width="164" height="48" rx="9" />
+    <text x="184" y="153" class="bt">1.7 GB Free VRAM</text>
+    <text x="184" y="169" class="bs">Zero WDDM Paging</text>
+    <rect class="pill-or" x="102" y="210" width="164" height="48" rx="9" />
+    <text x="184" y="231" class="bt">BF12 + CS6 Index</text>
+    <text x="184" y="247" class="bs">12.01 b/w · 0.023% CSR</text>
+    <rect class="pill-in" x="102" y="382" width="164" height="48" rx="9" />
+    <text x="184" y="403" class="bt">Disk BF16 (0% Mod)</text>
+    <text x="184" y="419" class="bs">8.25 GB → 6.02 GB RAM</text>
+  </g>
+
+  <!-- STAGE 1: GDDR6X Bus Saturation -->
+  <g class="c1">
+    <text x="369" y="101" class="outt">745 GB/s (98%)</text>
+    <rect class="pill-em" x="287" y="132" width="164" height="48" rx="9" />
+    <text x="369" y="153" class="bt">Paged KV + Slots</text>
+    <text x="369" y="169" class="bs">512 Blks · 8,192 Tok</text>
+    <rect class="pill-or" x="287" y="210" width="164" height="48" rx="9" />
+    <text x="369" y="231" class="bt">Persistent 272-Blk</text>
+    <text x="369" y="247" class="bs">4 blk/SM · 0 Wave Tail</text>
+    <rect class="pill-in" x="287" y="382" width="164" height="48" rx="9" />
+    <text x="369" y="403" class="bt">uint4 + uint2 Bus</text>
+    <text x="369" y="419" class="bs">1× Read / 8 Users!</text>
+  </g>
+
+  <!-- STAGE 2: Tensor Core Decode (B=8) -->
+  <g class="c2">
+    <text x="554" y="101" class="outt">595.1 tok/s (B=8)</text>
+    <rect class="pill-em" x="472" y="132" width="164" height="48" rx="9" />
+    <text x="554" y="153" class="bt">128-th Coalesced Y</text>
+    <text x="554" y="169" class="bs">13.44 ms/step · 8/8 OK</text>
+    <rect class="pill-or" x="472" y="210" width="164" height="48" rx="9" />
+    <text x="554" y="231" class="bt">PTX MMA m16n8k16</text>
+    <text x="554" y="247" class="bs">SK=4 + CS6 0-F2FP</text>
+    <rect class="pill-in" x="472" y="382" width="164" height="48" rx="9" />
+    <text x="554" y="403" class="bt">XOR Swizzled SMEM</text>
+    <text x="554" y="419" class="bs">0 Bank Conflicts</text>
+  </g>
+
+  <!-- STAGE 3: 1-Pass Prefill IMMA-128 -->
+  <g class="c3">
+    <text x="739" y="101" class="outt">8,109 tok/s Prefill</text>
+    <rect class="pill-em" x="657" y="132" width="164" height="48" rx="9" />
+    <text x="739" y="153" class="bt">Fused SwiGLU+Res</text>
+    <text x="739" y="169" class="bs">63.1 ms@512 · 33 ms@128</text>
+    <rect class="pill-or" x="657" y="210" width="164" height="48" rx="9" />
+    <text x="739" y="231" class="bt">IMMA 128×128 + WY</text>
+    <text x="739" y="247" class="bs">RegO FA2 · 0 C_i32 DRAM</text>
+    <rect class="pill-in" x="657" y="382" width="164" height="48" rx="9" />
+    <text x="739" y="403" class="bt">1-Pass Exact-Warp</text>
+    <text x="739" y="419" class="bs">160/256/288 th · 0 Idle</text>
+  </g>
+
+  <!-- Glowing Moving Data Packet Dots -->
+  <circle class="dot0" cx="184" cy="390" r="4.2" fill="#f9fafb" />
+  <circle class="dot1" cx="369" cy="390" r="4.2" fill="#f9fafb" />
+  <circle class="dot2" cx="554" cy="390" r="4.2" fill="#34d399" />
+  <circle class="dot3" cx="739" cy="390" r="4.2" fill="#34d399" />
+
+  <!-- Bottom Stage Brackets -->
+  <g>
+    <path class="ruler" d="M104 452 H264 M104 448 V456 M264 448 V456" />
+    <text x="184" y="473" class="frlbl">1. lossless compress</text>
+    <path class="ruler" d="M289 452 H449 M289 448 V456 M449 448 V456" />
+    <text x="369" y="473" class="frlbl">2. gddr6x bus</text>
+    <path class="ruler" d="M474 452 H634 M474 448 V456 M634 448 V456" />
+    <text x="554" y="473" class="frlbl">3. batch b=8 decode</text>
+    <path class="ruler" d="M659 452 H819 M659 448 V456 M819 448 V456" />
+    <text x="739" y="473" class="frlbl">4. prefill imma-128</text>
+  </g>
+
+  <!-- Footer Note -->
+  <text x="28" y="502" class="sub">Zero Python · Zero PyTorch · Direct nvcuda.dll Driver API · 8/8 Concurrent HTTP Isolated (440.7 tok/s E2E, 0 KV leaks) · Needle-1024 Exact</text>
+</svg>

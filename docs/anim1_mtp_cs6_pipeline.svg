@@ -1,0 +1,252 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 520" width="860" height="520">
+  <defs>
+    <style>
+      .bg { fill: #171717; }
+      .title { fill: #f3f4f6; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 16px; font-weight: 700; }
+      .sub { fill: #9ca3af; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 12.5px; }
+      .metric { fill: #9ca3af; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+      .rowlbl { fill: #9ca3af; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 12px; text-anchor: end; }
+      .frlbl { fill: #9ca3af; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 12px; text-anchor: middle; }
+      .bt { fill: #f9fafb; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 12px; font-weight: 600; text-anchor: middle; }
+      .bs { fill: #d1d5db; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10.5px; text-anchor: middle; }
+      .outt { fill: #34d399; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; font-weight: 700; text-anchor: middle; }
+      .coret { fill: #f3f4f6; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 13px; font-weight: 600; text-anchor: middle; }
+      .cores { fill: #a5b4fc; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; text-anchor: middle; }
+      .pill-em { fill: #248a6b; stroke: #34d399; stroke-width: 1; }
+      .pill-or { fill: #c46835; stroke: #fb923c; stroke-width: 1; }
+      .pill-in { fill: #5e56c8; stroke: #818cf8; stroke-width: 1; }
+      .pill-dk { fill: #26262a; stroke: #404048; stroke-width: 1; }
+      .arr { fill: none; stroke: #6b7280; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+      .ruler { fill: none; stroke: #404048; stroke-width: 1; }
+
+      /* Progressive 5-stage illumination over 7.5s loop */
+      @keyframes st0 {
+        0%, 3%   { opacity: 0.22; }
+        6%, 88%  { opacity: 1; }
+        94%, 100%{ opacity: 0.22; }
+      }
+      @keyframes st1 {
+        0%, 19%  { opacity: 0.22; }
+        23%, 88% { opacity: 1; }
+        94%, 100%{ opacity: 0.22; }
+      }
+      @keyframes st2 {
+        0%, 36%  { opacity: 0.22; }
+        40%, 88% { opacity: 1; }
+        94%, 100%{ opacity: 0.22; }
+      }
+      @keyframes st3 {
+        0%, 53%  { opacity: 0.22; }
+        57%, 88% { opacity: 1; }
+        94%, 100%{ opacity: 0.22; }
+      }
+      @keyframes st4 {
+        0%, 70%  { opacity: 0.22; }
+        74%, 88% { opacity: 1; }
+        94%, 100%{ opacity: 0.22; }
+      }
+      .c0 { animation: st0 7.5s ease-in-out infinite; }
+      .c1 { animation: st1 7.5s ease-in-out infinite; }
+      .c2 { animation: st2 7.5s ease-in-out infinite; }
+      .c3 { animation: st3 7.5s ease-in-out infinite; }
+      .c4 { animation: st4 7.5s ease-in-out infinite; }
+
+      /* Glowing packet dot rising through each active column */
+      @keyframes rise0 {
+        0%, 4%   { transform: translateY(0px); opacity: 0; }
+        6%       { transform: translateY(0px); opacity: 1; }
+        19%      { transform: translateY(-285px); opacity: 1; }
+        22%, 100%{ transform: translateY(-285px); opacity: 0; }
+      }
+      @keyframes rise1 {
+        0%, 21%  { transform: translateY(0px); opacity: 0; }
+        23%      { transform: translateY(0px); opacity: 1; }
+        36%      { transform: translateY(-285px); opacity: 1; }
+        39%, 100%{ transform: translateY(-285px); opacity: 0; }
+      }
+      @keyframes rise2 {
+        0%, 38%  { transform: translateY(0px); opacity: 0; }
+        40%      { transform: translateY(0px); opacity: 1; }
+        53%      { transform: translateY(-285px); opacity: 1; }
+        56%, 100%{ transform: translateY(-285px); opacity: 0; }
+      }
+      @keyframes rise3 {
+        0%, 55%  { transform: translateY(0px); opacity: 0; }
+        57%      { transform: translateY(0px); opacity: 1; }
+        70%      { transform: translateY(-285px); opacity: 1; }
+        73%, 100%{ transform: translateY(-285px); opacity: 0; }
+      }
+      @keyframes rise4 {
+        0%, 72%  { transform: translateY(0px); opacity: 0; }
+        74%      { transform: translateY(0px); opacity: 1; }
+        86%      { transform: translateY(-285px); opacity: 1; }
+        89%, 100%{ transform: translateY(-285px); opacity: 0; }
+      }
+      .dot0 { animation: rise0 7.5s linear infinite; }
+      .dot1 { animation: rise1 7.5s linear infinite; }
+      .dot2 { animation: rise2 7.5s linear infinite; }
+      .dot3 { animation: rise3 7.5s linear infinite; }
+      .dot4 { animation: rise4 7.5s linear infinite; }
+
+      /* Sliding highlight inside the spanning Engine bar */
+      @keyframes coreSlide {
+        0%, 19%  { transform: translateX(0px); }
+        22%, 36% { transform: translateX(148px); }
+        39%, 53% { transform: translateX(296px); }
+        56%, 70% { transform: translateX(444px); }
+        73%, 91% { transform: translateX(592px); }
+        95%, 100%{ transform: translateX(0px); }
+      }
+      .hi-bar { animation: coreSlide 7.5s ease-in-out infinite; }
+    </style>
+    <clipPath id="coreClip">
+      <rect x="92" y="294" width="740" height="54" rx="10" />
+    </clipPath>
+  </defs>
+
+  <!-- Card Background -->
+  <rect class="bg" x="0" y="0" width="860" height="520" rx="14" />
+
+  <!-- Header -->
+  <text x="28" y="36" class="title">Fast-Serve Phase R16 — Decode Pipeline</text>
+  <text x="832" y="36" class="metric" text-anchor="end">193.1 tok/s · 14.37 ms / cycle · CV 0.71%</text>
+  <text x="28" y="57" class="sub">1 High-Priority CUDA Graph cycle drafts &amp; verifies 4 tokens in parallel — 100.000% Provably Bit-Exact</text>
+
+  <!-- Row Labels (Left Column) -->
+  <text x="76" y="101" class="rowlbl">output</text>
+  <text x="76" y="158" class="rowlbl">pass 2</text>
+  <text x="76" y="236" class="rowlbl">pass 1</text>
+  <text x="76" y="325" class="rowlbl">engine</text>
+  <text x="76" y="408" class="rowlbl">input</text>
+
+  <!-- Static Subtle Vertical Arrows for all 5 columns (centers: 166, 314, 462, 610, 758) -->
+  <g opacity="0.55">
+    <!-- Col 0 (x=166) -->
+    <path class="arr" d="M166 130 V112 M162 117 L166 112 L170 117" />
+    <path class="arr" d="M166 208 V184 M162 189 L166 184 L170 189" />
+    <path class="arr" d="M166 292 V264 M162 269 L166 264 L170 269" />
+    <path class="arr" d="M166 378 V352 M162 357 L166 352 L170 357" />
+    <!-- Col 1 (x=314) -->
+    <path class="arr" d="M314 130 V112 M310 117 L314 112 L318 117" />
+    <path class="arr" d="M314 208 V184 M310 189 L314 184 L318 189" />
+    <path class="arr" d="M314 292 V264 M310 269 L314 264 L318 269" />
+    <path class="arr" d="M314 378 V352 M310 357 L314 352 L318 357" />
+    <!-- Col 2 (x=462) -->
+    <path class="arr" d="M462 130 V112 M458 117 L462 112 L466 117" />
+    <path class="arr" d="M462 208 V184 M458 189 L462 184 L466 189" />
+    <path class="arr" d="M462 292 V264 M458 269 L462 264 L466 269" />
+    <path class="arr" d="M462 378 V352 M458 357 L462 352 L466 357" />
+    <!-- Col 3 (x=610) -->
+    <path class="arr" d="M610 130 V112 M606 117 L610 112 L614 117" />
+    <path class="arr" d="M610 208 V184 M606 189 L610 184 L614 189" />
+    <path class="arr" d="M610 292 V264 M606 269 L610 264 L614 269" />
+    <path class="arr" d="M610 378 V352 M606 357 L610 352 L614 357" />
+    <!-- Col 4 (x=758) -->
+    <path class="arr" d="M758 130 V112 M754 117 L758 112 L762 117" />
+    <path class="arr" d="M758 208 V184 M754 189 L758 184 L762 189" />
+    <path class="arr" d="M758 292 V264 M754 269 L758 264 L762 269" />
+    <path class="arr" d="M758 378 V352 M754 357 L758 352 L762 357" />
+  </g>
+
+  <!-- SPANNING ENGINE BAR (Haru-4B wide "Language model" pill) -->
+  <rect class="pill-dk" x="92" y="294" width="740" height="54" rx="10" />
+  <g clip-path="url(#coreClip)">
+    <rect class="hi-bar" x="92" y="294" width="148" height="54" fill="#6366f1" fill-opacity="0.22" />
+  </g>
+  <text x="462" y="317" class="coret">Qwen3.5-4B · 2-Part Split (L0..15 → Bridge → L16..31) · BF12-Lossless (6.02 GB, -25% DRAM)</text>
+  <text x="462" y="335" class="cores">118 Custom CUDA/PTX Kernels · 0 Bytes Spill · 0 cuBLAS in Decode · High-Priority CUDA Graph</text>
+
+  <!-- COLUMN 0: Draft 1 -->
+  <g class="c0">
+    <text x="166" y="101" class="outt">d₁: "fib"</text>
+    <rect class="pill-em" x="102" y="132" width="128" height="48" rx="9" />
+    <text x="166" y="153" class="bt">Exact BF12</text>
+    <text x="166" y="169" class="bs">5.1 µs (~12 rows)</text>
+    <rect class="pill-or" x="102" y="210" width="128" height="48" rx="9" />
+    <text x="166" y="231" class="bt">CS6 INT6-G64</text>
+    <text x="166" y="247" class="bs">0.72 ms (-50%)</text>
+    <rect class="pill-in" x="102" y="382" width="128" height="48" rx="9" />
+    <text x="166" y="403" class="bt">MTP Draft 1</text>
+    <text x="166" y="419" class="bs">h₀ + t₀ (M=1)</text>
+  </g>
+
+  <!-- COLUMN 1: Draft 2 -->
+  <g class="c1">
+    <text x="314" y="101" class="outt">d₂: "(n"</text>
+    <rect class="pill-em" x="250" y="132" width="128" height="48" rx="9" />
+    <text x="314" y="153" class="bt">Exact BF12</text>
+    <text x="314" y="169" class="bs">5.1 µs (~12 rows)</text>
+    <rect class="pill-or" x="250" y="210" width="128" height="48" rx="9" />
+    <text x="314" y="231" class="bt">CS6 INT6-G64</text>
+    <text x="314" y="247" class="bs">0.72 ms (-50%)</text>
+    <rect class="pill-in" x="250" y="382" width="128" height="48" rx="9" />
+    <text x="314" y="403" class="bt">MTP Draft 2</text>
+    <text x="314" y="419" class="bs">h₁ + d₁ (M=1)</text>
+  </g>
+
+  <!-- COLUMN 2: Draft 3 -->
+  <g class="c2">
+    <text x="462" y="101" class="outt">d₃: "):"</text>
+    <rect class="pill-em" x="398" y="132" width="128" height="48" rx="9" />
+    <text x="462" y="153" class="bt">Exact BF12</text>
+    <text x="462" y="169" class="bs">5.1 µs (~12 rows)</text>
+    <rect class="pill-or" x="398" y="210" width="128" height="48" rx="9" />
+    <text x="462" y="231" class="bt">CS6 INT6-G64</text>
+    <text x="462" y="247" class="bs">0.72 ms (-50%)</text>
+    <rect class="pill-in" x="398" y="382" width="128" height="48" rx="9" />
+    <text x="462" y="403" class="bt">MTP Draft 3</text>
+    <text x="462" y="419" class="bs">h₂ + d₂ (M=1)</text>
+  </g>
+
+  <!-- COLUMN 3: Parallel Verify M=4 -->
+  <g class="c3">
+    <text x="610" y="101" class="outt">4/4 Bit-Exact</text>
+    <rect class="pill-em" x="546" y="132" width="128" height="48" rx="9" />
+    <text x="610" y="153" class="bt">Verify ×4</text>
+    <text x="610" y="169" class="bs">5.2 µs (Exact)</text>
+    <rect class="pill-or" x="546" y="210" width="128" height="48" rx="9" />
+    <text x="610" y="231" class="bt">CS6 MMA B&amp;B</text>
+    <text x="610" y="247" class="bs">0.93 ms (0-F2FP)</text>
+    <rect class="pill-in" x="546" y="382" width="128" height="48" rx="9" />
+    <text x="610" y="403" class="bt">[t₀, d₁, d₂, d₃]</text>
+    <text x="610" y="419" class="bs">1× 6GB Read (M=4)</text>
+  </g>
+
+  <!-- COLUMN 4: Exact Commit -->
+  <g class="c4">
+    <text x="758" y="101" class="outt">Emit +4 tok!</text>
+    <rect class="pill-em" x="694" y="132" width="128" height="48" rx="9" />
+    <text x="758" y="153" class="bt">Commit KV+S</text>
+    <text x="758" y="169" class="bs">4-Chunk FP32</text>
+    <rect class="pill-or" x="694" y="210" width="128" height="48" rx="9" />
+    <text x="758" y="231" class="bt">99.97% Pruned</text>
+    <text x="758" y="247" class="bs">248,320 → ~12</text>
+    <rect class="pill-dk" x="694" y="382" width="128" height="48" rx="9" />
+    <text x="758" y="403" class="bt">Zero CPU Sync</text>
+    <text x="758" y="419" class="bs">±0.10 ms Jitter</text>
+  </g>
+
+  <!-- Glowing Moving Data Packet Dots -->
+  <circle class="dot0" cx="166" cy="390" r="4.2" fill="#f9fafb" />
+  <circle class="dot1" cx="314" cy="390" r="4.2" fill="#f9fafb" />
+  <circle class="dot2" cx="462" cy="390" r="4.2" fill="#f9fafb" />
+  <circle class="dot3" cx="610" cy="390" r="4.2" fill="#f9fafb" />
+  <circle class="dot4" cx="758" cy="390" r="4.2" fill="#34d399" />
+
+  <!-- Bottom Timeline Rulers (Haru-4B frame brackets) -->
+  <g>
+    <path class="ruler" d="M104 452 H228 M104 448 V456 M228 448 V456" />
+    <text x="166" y="473" class="frlbl">draft 1 · 0.8 ms</text>
+    <path class="ruler" d="M252 452 H376 M252 448 V456 M376 448 V456" />
+    <text x="314" y="473" class="frlbl">draft 2 · 0.8 ms</text>
+    <path class="ruler" d="M400 452 H524 M400 448 V456 M524 448 V456" />
+    <text x="462" y="473" class="frlbl">draft 3 · 0.8 ms</text>
+    <path class="ruler" d="M548 452 H672 M548 448 V456 M672 448 V456" />
+    <text x="610" y="473" class="frlbl">verify ×4 · 11.1 ms</text>
+    <path class="ruler" d="M696 452 H820 M696 448 V456 M820 448 V456" />
+    <text x="758" y="473" class="frlbl">commit · 0.8 ms</text>
+  </g>
+
+  <!-- Footer Note -->
+  <text x="28" y="502" class="sub">Cauchy–Schwarz B&amp;B: U_v = d̂_v + ε_v‖x‖₂ ≥ w_v·x ≥ d̂_v − ε_v‖x‖₂ = L_v → prunes 99.95–99.999% with 0% accuracy loss (214 tok/s HTTP · 263.8 tok/s Python)</text>
+</svg>
