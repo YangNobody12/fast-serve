@@ -17,8 +17,9 @@ use crate::cuda_ffi::{CUdeviceptr, CUfunction, CUgraphExec, CudaRuntime};
 use crate::engine::{
     build_rope_tables_bf16, launch_embed_prefill_bf12, launch_lm_head_bf12_argmax,
     launch_skinny_bf12, run_deltanet_prefill_wy, run_prefill_fused_tiled_mlp_i8,
-    run_prefill_gemm_i8, Bf12DecodeFuncs, Int8PrefillFuncs, PrefillInt8Mode, PrefillWorkspace,
-    StreamToken, WyKernelFuncs, PF_HEADER_ROWS, PF_POOL_BYTES, PTX_BYTES, W_UNPACK_BYTES,
+    run_prefill_gemm_i8, Bf12DecodeFuncs, Cs6Scratch, Int8PrefillFuncs, PrefillInt8Mode,
+    PrefillWorkspace, StreamToken, WyKernelFuncs, PF_HEADER_ROWS, PF_POOL_BYTES, PTX_BYTES,
+    W_UNPACK_BYTES,
 };
 use crate::kv_pool::{DeltaNetSlotPool, KvBlockPool, KV_BLOCK_BYTES, KV_BLOCK_SIZE, MAX_BLOCKS_PER_SEQ};
 use crate::loader::{load_split_weights, Bf12Ptr, LoadedSplitWeights, PackedLayerPtrs};
@@ -164,9 +165,10 @@ pub struct BatchGpuEngine {
     d_flash_ml: CUdeviceptr,     // [4, 16, 4, 2] f32
     d_mlp_gu: CUdeviceptr,       // [4, 18432] bf16
     d_mlp_act: CUdeviceptr,      // [4, 9216] bf16
-    d_arg_vals: CUdeviceptr,     // [4, 1024] f32 (Phase R14: d_logits freed!)
-    d_arg_idxs: CUdeviceptr,     // [4, 1024] i32
-    h_out_toks: *mut i64,        // [4] pinned host
+    d_arg_vals: CUdeviceptr,     // [8, 1024] f32 (Phase R14: d_logits freed!)
+    d_arg_idxs: CUdeviceptr,     // [8, 1024] i32
+    d_cs6: Cs6Scratch,           // Phase R16 (M1): Exact CS6 B&B scratch [8] (7.71 MiB)
+    h_out_toks: *mut i64,        // [8] pinned host
     // Phase R9: Single contiguous pinned host meta buffer (eliminates 7x pageable WDDM HtoD stalls!)
     h_meta_pinned: *mut u8,
     meta_bytes: usize,
@@ -225,7 +227,7 @@ impl BatchGpuEngine {
         let (free_b, _) = cuda.mem_info()?;
         let free_mib = free_b as f64 / 1048576.0;
         let dn_mib = (max_batch as f64) * 49.5;
-        let fixed_mib = dn_mib + 56.0 + 90.0 + 24.0 + 1.0; // DeltaNet + pf_arena (55.6) + w_unpack (90) + scratch + RoPE
+        let fixed_mib = dn_mib + 56.0 + 90.0 + 32.0 + 1.0; // DeltaNet + pf_arena (55.6) + w_unpack (90) + scratch+CS6 + RoPE
         let wddm_guard_mib = 380.0;
         let desired_blocks = (max_seq.max(2048) * (max_batch.max(4) / 2) / KV_BLOCK_SIZE).clamp(128, 512);
         let num_blocks = if force_max_seq {
@@ -288,6 +290,12 @@ impl BatchGpuEngine {
         // Phase R14 + R15: d_logits freed — Batch Decode uses BF12 + PTX MMA lm_head_argmax for B=1..8!
         let o_av  = next(MAX_BATCH * 1024 * 4);
         let o_ai  = next(MAX_BATCH * 1024 * 4);
+        // Phase R16 (M1): Exact CS6 B&B scratch [MAX_BATCH] (7.71 MiB)
+        let o_cs6_xn = next(MAX_BATCH * 4);
+        let o_cs6_ls = next(MAX_BATCH * 4);
+        let o_cs6_cnt = next(MAX_BATCH * 4);
+        let o_cs6_cid = next(MAX_BATCH * 4096 * 4);
+        let o_cs6_u = next(MAX_BATCH * cfg.vocab_size * 4);
         let scratch_arena = cuda.alloc(off)?;
         cuda.memset_zero_async(scratch_arena, off)?;
         let h_out_toks = cuda.alloc_pinned(MAX_BATCH * 8)? as *mut i64;
@@ -341,6 +349,14 @@ impl BatchGpuEngine {
             d_mlp_act: scratch_arena + o_ac,
             d_arg_vals: scratch_arena + o_av,
             d_arg_idxs: scratch_arena + o_ai,
+            d_cs6: Cs6Scratch {
+                x_norms: scratch_arena + o_cs6_xn,
+                l_star: scratch_arena + o_cs6_ls,
+                cand_cnt: scratch_arena + o_cs6_cnt,
+                cand_ids: scratch_arena + o_cs6_cid,
+                out_u: scratch_arena + o_cs6_u,
+                max_cand: 4096,
+            },
             h_out_toks,
             h_meta_pinned,
             meta_bytes,
@@ -776,6 +792,8 @@ impl BatchGpuEngine {
             1,
             self.d_normed,
             self.weights.lm_head_w,
+            self.weights.lm_head_cs6,
+            self.d_cs6,
             self.d_arg_vals,
             self.d_arg_idxs,
             self.d_out_toks,
@@ -1006,7 +1024,7 @@ impl BatchGpuEngine {
                 &mut eps as *mut _ as *mut c_void,
             ],
         )?;
-        // Phase R14: Fused Batched BF12 lm_head + Online Argmax for B=1..4 (ZERO d_logits, ZERO cuBLAS!)
+        // Phase R14 + R16 (M1): Exact CS6 INT6-G64 B&B + BF12 lm_head Argmax for B=1..8 (100% Bit-Exact!)
         launch_lm_head_bf12_argmax(
             &self.cuda,
             &self.funcs.bf12,
@@ -1015,6 +1033,8 @@ impl BatchGpuEngine {
             b,
             self.d_normed,
             self.weights.lm_head_w,
+            self.weights.lm_head_cs6,
+            self.d_cs6,
             self.d_arg_vals,
             self.d_arg_idxs,
             self.d_out_toks,

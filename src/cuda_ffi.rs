@@ -93,6 +93,8 @@ type FnCuMemcpyDtoDAsync = unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize,
 type FnCuMemHostAlloc = unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> CUresult;
 type FnCuMemFreeHost = unsafe extern "C" fn(*mut c_void) -> CUresult;
 type FnCuStreamCreate = unsafe extern "C" fn(*mut CUstream, c_uint) -> CUresult;
+type FnCuCtxGetStreamPriorityRange = unsafe extern "C" fn(*mut c_int, *mut c_int) -> CUresult;
+type FnCuStreamCreateWithPriority = unsafe extern "C" fn(*mut CUstream, c_uint, c_int) -> CUresult;
 type FnCuStreamSynchronize = unsafe extern "C" fn(CUstream) -> CUresult;
 type FnCuStreamBeginCapture = unsafe extern "C" fn(CUstream, c_int) -> CUresult;
 type FnCuStreamEndCapture = unsafe extern "C" fn(CUstream, *mut CUgraph) -> CUresult;
@@ -226,6 +228,10 @@ impl CudaRuntime {
             let cuMemHostAlloc: FnCuMemHostAlloc = *cuda_lib.get(b"cuMemHostAlloc\0")?;
             let cuMemFreeHost: FnCuMemFreeHost = *cuda_lib.get(b"cuMemFreeHost\0")?;
             let cuStreamCreate: FnCuStreamCreate = *cuda_lib.get(b"cuStreamCreate\0")?;
+            let cuCtxGetStreamPriorityRange: Option<FnCuCtxGetStreamPriorityRange> =
+                cuda_lib.get::<FnCuCtxGetStreamPriorityRange>(b"cuCtxGetStreamPriorityRange\0").ok().map(|f| *f);
+            let cuStreamCreateWithPriority: Option<FnCuStreamCreateWithPriority> =
+                cuda_lib.get::<FnCuStreamCreateWithPriority>(b"cuStreamCreateWithPriority\0").ok().map(|f| *f);
             let cuStreamSynchronize: FnCuStreamSynchronize = *cuda_lib.get(b"cuStreamSynchronize\0")?;
             let cuStreamBeginCapture: FnCuStreamBeginCapture = *cuda_lib.get(b"cuStreamBeginCapture_v2\0")?;
             let cuStreamEndCapture: FnCuStreamEndCapture = *cuda_lib.get(b"cuStreamEndCapture\0")?;
@@ -262,7 +268,19 @@ impl CudaRuntime {
             check_cu(cuCtxCreate(&mut ctx, 0, dev), "cuCtxCreate")?;
 
             let mut stream: CUstream = ptr::null_mut();
-            check_cu(cuStreamCreate(&mut stream, CU_STREAM_NON_BLOCKING), "cuStreamCreate")?;
+            let mut created_hipri = false;
+            if let (Some(get_range), Some(create_pri)) = (cuCtxGetStreamPriorityRange, cuStreamCreateWithPriority) {
+                let mut least_pri: c_int = 0;
+                let mut greatest_pri: c_int = 0;
+                if get_range(&mut least_pri, &mut greatest_pri) == CUDA_SUCCESS && greatest_pri < least_pri {
+                    if create_pri(&mut stream, CU_STREAM_NON_BLOCKING, greatest_pri) == CUDA_SUCCESS {
+                        created_hipri = true;
+                    }
+                }
+            }
+            if !created_hipri {
+                check_cu(cuStreamCreate(&mut stream, CU_STREAM_NON_BLOCKING), "cuStreamCreate")?;
+            }
 
             let mut cublas: CublasHandle = ptr::null_mut();
             check_cublas(cublasCreate(&mut cublas), "cublasCreate")?;

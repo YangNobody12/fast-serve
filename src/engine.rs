@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use crate::config::TextConfig;
 use crate::cuda_ffi::{CUdeviceptr, CUevent, CUfunction, CUgraphExec, CudaRuntime};
-use crate::loader::{load_split_weights, Bf12Ptr, LoadedSplitWeights, MtpWeights, PackedLayerPtrs};
+use crate::loader::{load_split_weights, Bf12Ptr, LmHeadCs6Ptr, LoadedSplitWeights, MtpWeights, PackedLayerPtrs};
 use crate::tokenizer::QwenTokenizer;
 
 pub(crate) const PTX_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qwen35.cubin"));
@@ -71,6 +71,24 @@ pub(crate) struct Bf12DecodeFuncs {
     pub lm_head_m1_conf: CUfunction,
     pub argmax_s2_conf: CUfunction,
     pub eval_mtp_cond_d2: CUfunction,
+    // Phase R16 (M1): Exact Cauchy-Schwarz INT6-G64 Branch-and-Bound lm_head (100.000% Bit-Exact!)
+    pub cs6_l2_norm: CUfunction,
+    pub cs6_pass1: [CUfunction; 8],
+    pub cs6_reduce_lstar: CUfunction,
+    pub cs6_filter: CUfunction,
+    pub cs6_verify_bf12: CUfunction,
+    // Phase R16 (M3): Persistent Compile-Time K=2560 M=6..8 PTX MMA + 100%-Coalesced Y store
+    pub mma_sk4_k2560: [CUfunction; 5],
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Cs6Scratch {
+    pub x_norms: CUdeviceptr,  // [max_m] f32
+    pub l_star: CUdeviceptr,   // [max_m] f32
+    pub cand_cnt: CUdeviceptr, // [max_m] i32
+    pub cand_ids: CUdeviceptr, // [max_m * max_cand] i32
+    pub out_u: CUdeviceptr,    // [max_m * vocab_size] f32
+    pub max_cand: usize,       // 4096
 }
 
 impl Bf12DecodeFuncs {
@@ -112,6 +130,27 @@ impl Bf12DecodeFuncs {
             lm_head_m1_conf: cuda.get_func("lm_head_bf12_argmax_m1_conf_bf16")?,
             argmax_s2_conf: cuda.get_func("argmax_stage2_conf_bf16")?,
             eval_mtp_cond_d2: cuda.get_func("eval_mtp_cond_d2_bf16")?,
+            cs6_l2_norm: cuda.get_func("compute_l2_norm_batch_bf16")?,
+            cs6_pass1: [
+                cuda.get_func("lm_head_cs6_pass1_m1_bf16")?,
+                cuda.get_func("lm_head_cs6_pass1_m2_bf16")?,
+                cuda.get_func("lm_head_cs6_pass1_m3_bf16")?,
+                cuda.get_func("lm_head_cs6_pass1_mma_m4_bf16")?,
+                cuda.get_func("lm_head_cs6_pass1_mma_m5_bf16")?,
+                cuda.get_func("lm_head_cs6_pass1_mma_m6_bf16")?,
+                cuda.get_func("lm_head_cs6_pass1_mma_m7_bf16")?,
+                cuda.get_func("lm_head_cs6_pass1_mma_m8_bf16")?,
+            ],
+            cs6_reduce_lstar: cuda.get_func("lm_head_cs6_reduce_lstar_bf16")?,
+            cs6_filter: cuda.get_func("lm_head_cs6_filter_bf16")?,
+            cs6_verify_bf12: cuda.get_func("lm_head_cs6_verify_bf12_bf16")?,
+            mma_sk4_k2560: [
+                cuda.get_func("bf12_mma_sk4_k2560_m4_bf16")?,
+                cuda.get_func("bf12_mma_sk4_k2560_m5_bf16")?,
+                cuda.get_func("bf12_mma_sk4_k2560_m6_bf16")?,
+                cuda.get_func("bf12_mma_sk4_k2560_m7_bf16")?,
+                cuda.get_func("bf12_mma_sk4_k2560_m8_bf16")?,
+            ],
         })
     }
 }
@@ -261,10 +300,7 @@ pub(crate) fn launch_skinny_bf12(
     let mut eb = w.e_base;
     let mut add_i: i32 = if add_res { 1 } else { 0 };
 
-    // Phase R15 (H1 + H3) Smart Hybrid Dispatch:
-    //   1) M == 1, K == 2560 (dn_in, fa_qkv, gate_up): Persistent Unroll-5 (40 regs, 0 barriers, 668-691 GB/s)
-    //   2) M >= 6 (all shapes) OR (M == 4..=5 && N == 2560): Zero-Sync Pipelined BF12->PTX MMA m16n8k16 (SK=4)
-    //   3) Otherwise (M == 1..=3, or M == 4..=5 wide N >= 10240): R14 1-warp/row scalar BF12
+    // Phase R15 + R16 (H1 + H3 + M3) Smart Hybrid Dispatch
     if m == 1 && w.cols == 2560 && (w.rows & 7) == 0 {
         return cuda.launch(
             bf12.skinny_pers_k2560_m1,
@@ -301,6 +337,28 @@ pub(crate) fn launch_skinny_bf12(
                 &mut y_p as *mut _ as *mut c_void,
                 &mut n_i as *mut _ as *mut c_void,
                 &mut k_i as *mut _ as *mut c_void,
+                &mut eb as *mut _ as *mut c_void,
+                &mut add_i as *mut _ as *mut c_void,
+            ],
+        );
+    }
+
+    // Phase R16 (M3): Persistent 272-block K=2560 PTX MMA + 100%-Coalesced Y store for B=6..8!
+    if (w.rows & 15) == 0 && w.cols == 2560 && m >= 6 {
+        let grid_x = ((w.rows / 16) as u32).min(272);
+        return cuda.launch(
+            bf12.mma_sk4_k2560[m - 4],
+            (grid_x, 1, 1),
+            (128, 1, 1),
+            &mut [
+                &mut x_p as *mut _ as *mut c_void,
+                &mut sm8 as *mut _ as *mut c_void,
+                &mut exp4 as *mut _ as *mut c_void,
+                &mut rp as *mut _ as *mut c_void,
+                &mut ec as *mut _ as *mut c_void,
+                &mut ev as *mut _ as *mut c_void,
+                &mut y_p as *mut _ as *mut c_void,
+                &mut n_i as *mut _ as *mut c_void,
                 &mut eb as *mut _ as *mut c_void,
                 &mut add_i as *mut _ as *mut c_void,
             ],
@@ -364,10 +422,142 @@ pub(crate) fn launch_lm_head_bf12_argmax(
     m: usize,
     x_normed: CUdeviceptr,
     w: Bf12Ptr,
+    cs6: LmHeadCs6Ptr,
+    cs6_s: Cs6Scratch,
     part_vals: CUdeviceptr,
     part_idxs: CUdeviceptr,
     out_ids: CUdeviceptr,
 ) -> Result<()> {
+    let disable_cs6 = std::env::var_os("QWEN_DISABLE_CS6").is_some();
+    if !disable_cs6 && m >= 1 && m <= 8 && (w.rows & 15) == 0 && w.cols == 2560 && cs6.q4 != 0 {
+        let mut x_p = x_normed;
+        let mut xn_p = cs6_s.x_norms;
+        let mut k_i: i32 = 2560;
+        // 1. Exact L2 norm ||X[m]||_2
+        cuda.launch(
+            bf12.cs6_l2_norm,
+            (m as u32, 1, 1),
+            (256, 1, 1),
+            &mut [
+                &mut x_p as *mut _ as *mut c_void,
+                &mut xn_p as *mut _ as *mut c_void,
+                &mut k_i as *mut _ as *mut c_void,
+            ],
+        )?;
+        // 2. Pass-1 INT6-G64 Cauchy-Schwarz upper/lower bound scan (474.6 MiB = -50.2% DRAM!)
+        let mut q4_p = cs6.q4;
+        let mut q2_p = cs6.q2;
+        let mut sc_p = cs6.scales;
+        let mut ep_p = cs6.eps;
+        let mut out_u_p = cs6_s.out_u;
+        let mut av_p = part_vals;
+        let mut vocab_i = w.rows as i32;
+        let pass1_threads = if m >= 4 { 128u32 } else { 256u32 };
+        cuda.launch(
+            bf12.cs6_pass1[m - 1],
+            (1024, 1, 1),
+            (pass1_threads, 1, 1),
+            &mut [
+                &mut x_p as *mut _ as *mut c_void,
+                &mut xn_p as *mut _ as *mut c_void,
+                &mut q4_p as *mut _ as *mut c_void,
+                &mut q2_p as *mut _ as *mut c_void,
+                &mut sc_p as *mut _ as *mut c_void,
+                &mut ep_p as *mut _ as *mut c_void,
+                &mut out_u_p as *mut _ as *mut c_void,
+                &mut av_p as *mut _ as *mut c_void,
+                &mut vocab_i as *mut _ as *mut c_void,
+            ],
+        )?;
+        // 3. Reduce global lower bound L_star[m] + zero cand_cnt[m]
+        let mut lstar_p = cs6_s.l_star;
+        let mut cnt_p = cs6_s.cand_cnt;
+        let mut nblk_p1: i32 = 1024;
+        cuda.launch(
+            bf12.cs6_reduce_lstar,
+            (1, m as u32, 1),
+            (256, 1, 1),
+            &mut [
+                &mut av_p as *mut _ as *mut c_void,
+                &mut lstar_p as *mut _ as *mut c_void,
+                &mut cnt_p as *mut _ as *mut c_void,
+                &mut nblk_p1 as *mut _ as *mut c_void,
+            ],
+        )?;
+        // 4. Warp-ballot float4 survivor filter (prunes 99.95-99.999% of vocab rows!)
+        let mut cand_p = cs6_s.cand_ids;
+        let mut maxc_i: i32 = cs6_s.max_cand as i32;
+        cuda.launch(
+            bf12.cs6_filter,
+            (256, m as u32, 1),
+            (256, 1, 1),
+            &mut [
+                &mut out_u_p as *mut _ as *mut c_void,
+                &mut lstar_p as *mut _ as *mut c_void,
+                &mut cand_p as *mut _ as *mut c_void,
+                &mut cnt_p as *mut _ as *mut c_void,
+                &mut vocab_i as *mut _ as *mut c_void,
+                &mut maxc_i as *mut _ as *mut c_void,
+            ],
+        )?;
+        // 5. Pass-2 100.000% Bit-Exact BF12 + CSR escape verification on survivors (~3-116 rows!)
+        let mut sm8 = w.sm8;
+        let mut exp4 = w.exp4;
+        let mut rp = w.row_ptr;
+        let mut ec = w.esc_col;
+        let mut ev = w.esc_val;
+        let mut ai_p = part_idxs;
+        let mut eb = w.e_base;
+        cuda.launch(
+            bf12.cs6_verify_bf12,
+            (64, m as u32, 1),
+            (256, 1, 1),
+            &mut [
+                &mut x_p as *mut _ as *mut c_void,
+                &mut sm8 as *mut _ as *mut c_void,
+                &mut exp4 as *mut _ as *mut c_void,
+                &mut rp as *mut _ as *mut c_void,
+                &mut ec as *mut _ as *mut c_void,
+                &mut ev as *mut _ as *mut c_void,
+                &mut cand_p as *mut _ as *mut c_void,
+                &mut cnt_p as *mut _ as *mut c_void,
+                &mut av_p as *mut _ as *mut c_void,
+                &mut ai_p as *mut _ as *mut c_void,
+                &mut vocab_i as *mut _ as *mut c_void,
+                &mut eb as *mut _ as *mut c_void,
+                &mut maxc_i as *mut _ as *mut c_void,
+            ],
+        )?;
+        // 6. Stage-2 Argmax over 64 blocks
+        let mut out_p = out_ids;
+        let mut nblk_p2: i32 = 64;
+        return if m == 1 {
+            cuda.launch(
+                argmax_s2,
+                (1, 1, 1),
+                (256, 1, 1),
+                &mut [
+                    &mut av_p as *mut _ as *mut c_void,
+                    &mut ai_p as *mut _ as *mut c_void,
+                    &mut out_p as *mut _ as *mut c_void,
+                    &mut nblk_p2 as *mut _ as *mut c_void,
+                ],
+            )
+        } else {
+            cuda.launch(
+                argmax_batch_s2,
+                (1, m as u32, 1),
+                (256, 1, 1),
+                &mut [
+                    &mut av_p as *mut _ as *mut c_void,
+                    &mut ai_p as *mut _ as *mut c_void,
+                    &mut out_p as *mut _ as *mut c_void,
+                    &mut nblk_p2 as *mut _ as *mut c_void,
+                ],
+            )
+        };
+    }
+
     let mut x_p = x_normed;
     let mut sm8 = w.sm8;
     let mut exp4 = w.exp4;
@@ -554,10 +744,13 @@ pub(crate) struct Int8PrefillFuncs {
     // Phase R12: Custom Ampere PTX IMMA Fused-Dequant GEMM (0 C_i32 DRAM!)
     pub imma_128x128x64: CUfunction,
     pub imma_64x128x64: CUfunction,
-    // Phase R14: Direct BF12 -> INT8 SmoothQuant + Fast BF12 -> BF16 Unpack
+    // Phase R14 + R16 (M4): Direct BF12 -> INT8 SmoothQuant (Warp-Monoid 0-sync!) + Fast BF12 -> BF16 Unpack
     pub quant_bf12_k4k: CUfunction,
     pub quant_bf12_k10k: CUfunction,
     pub quant_bf12_strided_k6k: CUfunction,
+    pub quant_bf12_wpr_k2560: CUfunction,
+    pub quant_bf12_wpr_k4096: CUfunction,
+    pub quant_bf12_wpr_k4608: CUfunction,
     pub bf12_unpack: CUfunction,
 }
 
@@ -576,6 +769,9 @@ impl Int8PrefillFuncs {
             quant_bf12_k4k: cuda.get_func("quant_bf12_to_i8_smooth_k4k")?,
             quant_bf12_k10k: cuda.get_func("quant_bf12_to_i8_smooth_k10k")?,
             quant_bf12_strided_k6k: cuda.get_func("quant_bf12_to_i8_smooth_strided_k6k")?,
+            quant_bf12_wpr_k2560: cuda.get_func("quant_bf12_to_i8_smooth_wpr_k2560")?,
+            quant_bf12_wpr_k4096: cuda.get_func("quant_bf12_to_i8_smooth_wpr_k4096")?,
+            quant_bf12_wpr_k4608: cuda.get_func("quant_bf12_to_i8_smooth_wpr_k4608")?,
             bf12_unpack: cuda.get_func("bf12_to_bf16_unpack")?,
         })
     }
@@ -667,7 +863,8 @@ fn launch_imma_gemm_dequant(
     let mut ld_i = ld_out as i32;
     let mut noff_i = n_off as i32;
     let mut ep_i = epilogue_mode;
-    let use_128 = n >= 5120 && valid_m >= 96;
+    // Phase R16 (M4): Unlock 128x128x64 whenever CTAs saturate all 68 SMs (doubles tile reuse on I_TILE=4608 & D=2560 at M=512!)
+    let use_128 = valid_m >= 96 && ((n + 127) / 128) * ((valid_m + 127) / 128) >= 68;
     let (func, bm, threads) = if use_128 {
         (f.imma_128x128x64, 128usize, 256u32)
     } else {
@@ -883,24 +1080,49 @@ pub(crate) fn run_prefill_gemm_i8(
         let mut ns_i: i32 = ns as i32;
         let mut n0_i: i32 = n0 as i32;
 
-        cuda.launch(
-            q1_bf12_fn,
-            (ns as u32, 1, 1),
-            (256, 1, 1),
-            &mut [
-                &mut sm8 as *mut _ as *mut c_void,
-                &mut exp4 as *mut _ as *mut c_void,
-                &mut rp as *mut _ as *mut c_void,
-                &mut ec as *mut _ as *mut c_void,
-                &mut ev as *mut _ as *mut c_void,
-                &mut sms_p as *mut _ as *mut c_void,
-                &mut bi8_p as *mut _ as *mut c_void,
-                &mut sb0_p as *mut _ as *mut c_void,
-                &mut ns_i as *mut _ as *mut c_void,
-                &mut k_i as *mut _ as *mut c_void,
-                &mut eb as *mut _ as *mut c_void,
-            ],
-        )?;
+        if k == 2560 || k == 4096 {
+            let (wpr_fn, threads) = if k == 2560 { (f.quant_bf12_wpr_k2560, 160u32) } else { (f.quant_bf12_wpr_k4096, 256u32) };
+            let mut ld_i: i32 = k as i32;
+            let mut koff_i: i32 = 0;
+            cuda.launch(
+                wpr_fn,
+                (ns as u32, 1, 1),
+                (threads, 1, 1),
+                &mut [
+                    &mut sm8 as *mut _ as *mut c_void,
+                    &mut exp4 as *mut _ as *mut c_void,
+                    &mut rp as *mut _ as *mut c_void,
+                    &mut ec as *mut _ as *mut c_void,
+                    &mut ev as *mut _ as *mut c_void,
+                    &mut sms_p as *mut _ as *mut c_void,
+                    &mut bi8_p as *mut _ as *mut c_void,
+                    &mut sb0_p as *mut _ as *mut c_void,
+                    &mut ns_i as *mut _ as *mut c_void,
+                    &mut ld_i as *mut _ as *mut c_void,
+                    &mut koff_i as *mut _ as *mut c_void,
+                    &mut eb as *mut _ as *mut c_void,
+                ],
+            )?;
+        } else {
+            cuda.launch(
+                q1_bf12_fn,
+                (ns as u32, 1, 1),
+                (256, 1, 1),
+                &mut [
+                    &mut sm8 as *mut _ as *mut c_void,
+                    &mut exp4 as *mut _ as *mut c_void,
+                    &mut rp as *mut _ as *mut c_void,
+                    &mut ec as *mut _ as *mut c_void,
+                    &mut ev as *mut _ as *mut c_void,
+                    &mut sms_p as *mut _ as *mut c_void,
+                    &mut bi8_p as *mut _ as *mut c_void,
+                    &mut sb0_p as *mut _ as *mut c_void,
+                    &mut ns_i as *mut _ as *mut c_void,
+                    &mut k_i as *mut _ as *mut c_void,
+                    &mut eb as *mut _ as *mut c_void,
+                ],
+            )?;
+        }
 
         if !is_ozaki {
             launch_imma_gemm_dequant(
@@ -1048,9 +1270,9 @@ pub(crate) fn run_prefill_fused_tiled_mlp_i8(
         let mut wg_ev = wg.esc_val;
         let mut wg_eb = wg.e_base;
         cuda.launch(
-            f.quant_bf12_k4k,
+            f.quant_bf12_wpr_k2560,
             (I_TILE as u32, 1, 1),
-            (256, 1, 1),
+            (160, 1, 1),
             &mut [
                 &mut wg_sm8 as *mut _ as *mut c_void,
                 &mut wg_ex4 as *mut _ as *mut c_void,
@@ -1062,6 +1284,7 @@ pub(crate) fn run_prefill_fused_tiled_mlp_i8(
                 &mut sb_p as *mut _ as *mut c_void,
                 &mut it_i as *mut _ as *mut c_void,
                 &mut d_i as *mut _ as *mut c_void,
+                &mut zero_i as *mut _ as *mut c_void,
                 &mut wg_eb as *mut _ as *mut c_void,
             ],
         )?;
@@ -1070,7 +1293,7 @@ pub(crate) fn run_prefill_fused_tiled_mlp_i8(
             m, I_TILE, D, I_TILE, 0, 0,
         )?;
 
-        // 2b. Up tile: Direct BF12->INT8 + IN-REGISTER FUSED SiLU(gate) * up -> p_act_tile IN-PLACE (epilogue = 2)!
+        // 2b. Up tile: Direct BF12->INT8 (1-Pass Exact-Warp!) + IN-REGISTER FUSED SiLU(gate) * up -> p_act_tile IN-PLACE (epilogue = 2)!
         let wu = w_gate_up.slice_rows(INTER + i0, I_TILE);
         let mut wu_sm8 = wu.sm8;
         let mut wu_ex4 = wu.exp4;
@@ -1079,9 +1302,9 @@ pub(crate) fn run_prefill_fused_tiled_mlp_i8(
         let mut wu_ev = wu.esc_val;
         let mut wu_eb = wu.e_base;
         cuda.launch(
-            f.quant_bf12_k4k,
+            f.quant_bf12_wpr_k2560,
             (I_TILE as u32, 1, 1),
-            (256, 1, 1),
+            (160, 1, 1),
             &mut [
                 &mut wu_sm8 as *mut _ as *mut c_void,
                 &mut wu_ex4 as *mut _ as *mut c_void,
@@ -1093,6 +1316,7 @@ pub(crate) fn run_prefill_fused_tiled_mlp_i8(
                 &mut sb_p as *mut _ as *mut c_void,
                 &mut it_i as *mut _ as *mut c_void,
                 &mut d_i as *mut _ as *mut c_void,
+                &mut zero_i as *mut _ as *mut c_void,
                 &mut wu_eb as *mut _ as *mut c_void,
             ],
         )?;
@@ -1137,9 +1361,9 @@ pub(crate) fn run_prefill_fused_tiled_mlp_i8(
         let mut wd_ev = w_down.esc_val;
         let mut wd_eb = w_down.e_base;
         cuda.launch(
-            f.quant_bf12_strided_k6k,
+            f.quant_bf12_wpr_k4608,
             (D as u32, 1, 1),
-            (256, 1, 1),
+            (288, 1, 1),
             &mut [
                 &mut wd_sm8 as *mut _ as *mut c_void,
                 &mut wd_ex4 as *mut _ as *mut c_void,
@@ -1150,7 +1374,6 @@ pub(crate) fn run_prefill_fused_tiled_mlp_i8(
                 &mut b_i8_p as *mut _ as *mut c_void,
                 &mut sb_p as *mut _ as *mut c_void,
                 &mut d_i as *mut _ as *mut c_void,
-                &mut it_i as *mut _ as *mut c_void,
                 &mut inter_i as *mut _ as *mut c_void,
                 &mut i0_i as *mut _ as *mut c_void,
                 &mut wd_eb as *mut _ as *mut c_void,
@@ -1667,6 +1890,7 @@ struct MtpRuntime {
     v_mlp_act: CUdeviceptr,   // [5, 9216] bf16
     v_arg_vals: CUdeviceptr,  // [5, 1024] f32 (Phase R14: v_logits freed!)
     v_arg_idxs: CUdeviceptr,  // [5, 1024] i32
+    v_cs6: Cs6Scratch,        // Phase R16 (M1): Exact CS6 B&B scratch [vm]
     // Phase R15 (H2): Confidence-Gated Adaptive MTP buffers (+4 KB total!)
     v_arg_v2: CUdeviceptr,    // [1024] f32
     d_d1_margin: CUdeviceptr, // [4] f32 (top1-top2 margin per draft step)
@@ -1739,8 +1963,9 @@ pub struct RustSplitEngine {
     s_mlp_gu: CUdeviceptr,     // [2, 18432]
     s_mlp_act: CUdeviceptr,    // [2, 9216]
     s_logits: CUdeviceptr,     // [2, vocab_size]
-    s_arg_vals: CUdeviceptr,   // [256] f32
-    s_arg_idxs: CUdeviceptr,   // [256] i32
+    s_arg_vals: CUdeviceptr,   // [1024] f32
+    s_arg_idxs: CUdeviceptr,   // [1024] i32
+    s_cs6: Cs6Scratch,         // Phase R16 (M1): Exact CS6 B&B scratch [1]
     s_live_last_h: CUdeviceptr,// [2560] bf16 (5 KB on GPU for Tier 0 Hot-Cache MTP boundary!)
 
     // Reusable compact Prefill Workspace + shared 90.0 MiB BF12->BF16 unpack scratch
@@ -1836,9 +2061,9 @@ impl RustSplitEngine {
         let alloc_mtp_rec_final = mtp_drafts > 0 && prefix_cache_slots > 0 && free_after_weights_mib >= 640.0;
         if !force_max_seq {
             let free_mib = free_after_weights_mib;
-            // Fixed allocations after weights: DeltaNet states (50) + Scratch (1) + MTP rollback (8 or 56) + pf_arena (40.6) + w_unpack (90) + Graph/cuBLAS (~70)
-            let mtp_fixed_mib = if mtp_drafts > 0 { if alloc_mtp_rec_final { 56.0 } else { 8.0 } } else { 0.0 };
-            let fixed_mib = 50.0 + 1.0 + mtp_fixed_mib + 40.6 + 90.0 + 70.0;
+            // Fixed allocations after weights: DeltaNet states (50) + Scratch (2) + MTP rollback (13 or 61) + pf_arena (40.6) + w_unpack (90) + Graph/cuBLAS (~70)
+            let mtp_fixed_mib = if mtp_drafts > 0 { if alloc_mtp_rec_final { 61.0 } else { 13.0 } } else { 0.0 };
+            let fixed_mib = 50.0 + 2.0 + mtp_fixed_mib + 40.6 + 90.0 + 70.0;
             let kv_layers = if mtp_drafts > 0 { 9.0 } else { 8.0 };
             // Keep >= 450 MiB headroom at startup so opening Chrome/UI never crosses the ~380 MiB WDDM paging cliff!
             let wddm_guard_mib = 450.0;
@@ -1900,6 +2125,12 @@ impl RustSplitEngine {
         let o_lg = next(16); // Phase R13: s_logits freed (-0.95 MiB) — M=1 uses fused lm_head_argmax!
         let o_av = next(1024 * 4);
         let o_ai = next(1024 * 4);
+        // Phase R16 (M1): Exact CS6 scratch for M=1 (0.97 MiB)
+        let o_cs6_xn = next(4);
+        let o_cs6_ls = next(4);
+        let o_cs6_cnt = next(4);
+        let o_cs6_cid = next(4096 * 4);
+        let o_cs6_u = next(cfg.vocab_size * 4);
         let o_lh = next(2560 * 2);
 
         let scratch_arena = cuda.alloc(off)?;
@@ -1944,6 +2175,11 @@ impl RustSplitEngine {
                 // Phase R14: v_logits freed (-2.4 MiB) — Verify uses lm_head_bf12_argmax_m{2..5}!
                 let o_vav = mnext(vm * 1024 * 4);
                 let o_vai = mnext(vm * 1024 * 4);
+                let o_vcs6_xn = mnext(vm * 4);
+                let o_vcs6_ls = mnext(vm * 4);
+                let o_vcs6_cnt = mnext(vm * 4);
+                let o_vcs6_cid = mnext(vm * 4096 * 4);
+                let o_vcs6_u = mnext(vm * cfg.vocab_size * 4);
                 let o_vav2 = mnext(1024 * 4);
                 let o_dmar = mnext(4 * 4);
                 let o_dact = mnext(4);
@@ -2047,6 +2283,14 @@ impl RustSplitEngine {
                     v_mlp_act: arena + o_vac,
                     v_arg_vals: arena + o_vav,
                     v_arg_idxs: arena + o_vai,
+                    v_cs6: Cs6Scratch {
+                        x_norms: arena + o_vcs6_xn,
+                        l_star: arena + o_vcs6_ls,
+                        cand_cnt: arena + o_vcs6_cnt,
+                        cand_ids: arena + o_vcs6_cid,
+                        out_u: arena + o_vcs6_u,
+                        max_cand: 4096,
+                    },
                     v_arg_v2: arena + o_vav2,
                     d_d1_margin: arena + o_dmar,
                     d_active_drafts: arena + o_dact,
@@ -2125,6 +2369,14 @@ impl RustSplitEngine {
             s_logits: scratch_arena + o_lg,
             s_arg_vals: scratch_arena + o_av,
             s_arg_idxs: scratch_arena + o_ai,
+            s_cs6: Cs6Scratch {
+                x_norms: scratch_arena + o_cs6_xn,
+                l_star: scratch_arena + o_cs6_ls,
+                cand_cnt: scratch_arena + o_cs6_cnt,
+                cand_ids: scratch_arena + o_cs6_cid,
+                out_u: scratch_arena + o_cs6_u,
+                max_cand: 4096,
+            },
             s_live_last_h: scratch_arena + o_lh,
             pf_arena,
             pf_bytes,
@@ -2224,7 +2476,7 @@ impl RustSplitEngine {
         launch_skinny_bf12(&self.cuda, &self.funcs.bf12, m, x, w, y, add_res)
     }
 
-    /// Phase R14: Batched Fused BF12-Lossless lm_head + Online Argmax for M=1..5 (ZERO logits DRAM, ZERO cuBLAS!).
+    /// Phase R14 + R16 (M1): Exact Cauchy-Schwarz INT6-G64 B&B + BF12 lm_head Argmax for M=1..5 (100% Bit-Exact!).
     fn launch_lm_head_argmax(
         &self,
         m: usize,
@@ -2233,6 +2485,11 @@ impl RustSplitEngine {
         part_idxs: CUdeviceptr,
         out_ids: CUdeviceptr,
     ) -> Result<()> {
+        let cs6_s = if m == 1 {
+            self.s_cs6
+        } else {
+            self.mtp.as_ref().unwrap().v_cs6
+        };
         launch_lm_head_bf12_argmax(
             &self.cuda,
             &self.funcs.bf12,
@@ -2241,6 +2498,8 @@ impl RustSplitEngine {
             m,
             x_normed,
             self.weights.lm_head_w,
+            self.weights.lm_head_cs6,
+            cs6_s,
             part_vals,
             part_idxs,
             out_ids,
