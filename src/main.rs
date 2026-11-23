@@ -27,6 +27,7 @@ async fn main() -> Result<()> {
     let mut max_seq: usize = 2048;
     let mut max_batch: usize = 1;
     let mut mtp_drafts: usize = 3;
+    let mut mtp_conf_thresh: f32 = 0.8;
     let mut prefix_cache_slots: usize = 8;
     let mut force_max_seq = false;
     let mut skinny_m4_wide = true;
@@ -44,6 +45,7 @@ async fn main() -> Result<()> {
             "--max-seq" => { i += 1; max_seq = args[i].parse()?; }
             "--max-batch" => { i += 1; max_batch = args[i].parse()?; }
             "--mtp-drafts" => { i += 1; mtp_drafts = args[i].parse()?; }
+            "--mtp-conf-thresh" => { i += 1; mtp_conf_thresh = args[i].parse()?; }
             "--prefix-cache-slots" => { i += 1; prefix_cache_slots = args[i].parse()?; }
             "--force-max-seq" => { force_max_seq = true; }
             "--no-skinny-m4-wide" => { skinny_m4_wide = false; }
@@ -63,13 +65,23 @@ async fn main() -> Result<()> {
         i += 1;
     }
 
-    // ---- Phase R7: Continuous Batching + Paged KV Block Manager Mode (--max-batch 2..4) ----
+    // ---- Phase R7 + R15 (H3): Continuous Batching + Paged KV Block Manager Mode (--max-batch 2..8) ----
     if max_batch > 1 {
         if profile_nsys {
             use std::thread::sleep;
             use std::time::Duration;
             println!("[BatchEngine] Profiling Continuous Batching (B={max_batch}, max_seq={max_seq}, prefill_int8={prefill_int8:?})...");
             let mut beng = BatchGpuEngine::load(&model_dir, split_layer, max_seq, max_batch, force_max_seq, prefill_int8)?;
+            let (free_b, total_b) = beng.cuda.mem_info().unwrap_or((0, 0));
+            println!(
+                "[BatchEngine] Loaded in {:.2}s | MaxBatch={} | Ctx={} | VRAM alloc={:.1} MiB | free={:.1} MiB / {:.1} MiB",
+                beng.load_time_s,
+                beng.max_batch,
+                beng.max_seq,
+                beng.vram_allocated_mib(),
+                free_b as f64 / 1048576.0,
+                total_b as f64 / 1048576.0,
+            );
             let p_base = "Explain GPU inference serving architecture, continuous batching, paged KV cache, and Tensor Core GEMMs. ";
             let (mut ids128, _, _) = beng.tok.format_messages(&[ChatMsg { role: "user".into(), content: p_base.repeat(6) }])?;
             ids128.truncate(128);
@@ -119,8 +131,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    println!("[RustSplitServer] Loading Qwen3.5-4B (split_layer={split_layer}, max_seq={max_seq}, mtp_drafts={mtp_drafts}, prefix_cache_slots={prefix_cache_slots}, skinny_m4_wide={skinny_m4_wide}, prefill_int8={prefill_int8:?})...");
-    let mut eng = RustSplitEngine::load(&model_dir, split_layer, max_seq, mtp_drafts, prefix_cache_slots, force_max_seq, skinny_m4_wide, prefill_int8)?;
+    println!("[RustSplitServer] Loading Qwen3.5-4B (split_layer={split_layer}, max_seq={max_seq}, mtp_drafts={mtp_drafts}, mtp_conf_thresh={mtp_conf_thresh:.2}, prefix_cache_slots={prefix_cache_slots}, skinny_m4_wide={skinny_m4_wide}, prefill_int8={prefill_int8:?})...");
+    let mut eng = RustSplitEngine::load(&model_dir, split_layer, max_seq, mtp_drafts, mtp_conf_thresh, prefix_cache_slots, force_max_seq, skinny_m4_wide, prefill_int8)?;
     let (free_b, total_b) = eng.cuda.mem_info()?;
     println!(
         "[RustSplitServer] Loaded in {:.2}s | Ctx={} | MTP K={} | PrefixSlots={} | VRAM alloc={:.1} MiB | free={:.1} MiB / {:.1} MiB",
@@ -171,7 +183,8 @@ async fn main() -> Result<()> {
         let (dec_total, avg_dec, extra) = if eng.mtp_drafts() > 0 {
             let (cycles, ms) = eng.decode_64_mtp_profiled(&ids128, tok128)?;
             let (acc, drf, rate, avg_t) = eng.mtp_stats();
-            (ms, ms / 64.0, format!(" | MTP K={} cycles={cycles} accept={acc}/{drf} ({:.1}%) avg={avg_t:.2} tok/step", eng.mtp_drafts(), rate * 100.0))
+            let sk = eng.mtp_skipped_drafts();
+            (ms, ms / 64.0, format!(" | MTP K={} cycles={cycles} accept={acc}/{drf} ({:.1}%) skipped={sk} avg={avg_t:.2} tok/step", eng.mtp_drafts(), rate * 100.0))
         } else {
             let t_dec = Instant::now();
             let mut step_ms = Vec::with_capacity(64);
@@ -234,9 +247,10 @@ async fn main() -> Result<()> {
         let (acc, drf, rate, avg_t) = eng.mtp_stats();
         if drf > 0 {
             println!(
-                "[Test] MTP Stats (K={}): accepted={acc}/{drf} ({:.1}%) | avg={avg_t:.2} tok/verify-step",
+                "[Test] MTP Stats (K={}): accepted={acc}/{drf} ({:.1}%) | skipped={} | avg={avg_t:.2} tok/verify-step",
                 eng.mtp_drafts(),
-                rate * 100.0
+                rate * 100.0,
+                eng.mtp_skipped_drafts(),
             );
         }
         return Ok(());

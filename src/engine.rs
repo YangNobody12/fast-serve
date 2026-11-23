@@ -62,6 +62,15 @@ pub(crate) struct Bf12DecodeFuncs {
     pub mtp_pre_fc_concat: CUfunction,
     pub skinny: [CUfunction; 5],
     pub lm_head: [CUfunction; 5],
+    // Phase R15 (H1 + H3): Persistent K=2560 M=1 + 4wpr Long-K M=1 + Zero-Sync Pipelined BF12->PTX MMA m16n8k16 (M=4..8, SK=4)
+    pub skinny_pers_k2560_m1: CUfunction,
+    pub skinny_4wpr_m1: CUfunction,
+    pub mma_sk4: [CUfunction; 5],
+    pub lm_head_mma: [CUfunction; 5],
+    // Phase R15 (H2): Confidence-Gated Adaptive MTP (Top1-Top2 Margin + CUDA 12.8 Conditional IF)
+    pub lm_head_m1_conf: CUfunction,
+    pub argmax_s2_conf: CUfunction,
+    pub eval_mtp_cond_d2: CUfunction,
 }
 
 impl Bf12DecodeFuncs {
@@ -84,6 +93,25 @@ impl Bf12DecodeFuncs {
                 cuda.get_func("lm_head_bf12_argmax_m4_bf16")?,
                 cuda.get_func("lm_head_bf12_argmax_m5_bf16")?,
             ],
+            skinny_pers_k2560_m1: cuda.get_func("skinny_bf12_pers_k2560_m1_bf16")?,
+            skinny_4wpr_m1: cuda.get_func("skinny_bf12_4wpr_m1_bf16")?,
+            mma_sk4: [
+                cuda.get_func("bf12_mma_sk4_m4_bf16")?,
+                cuda.get_func("bf12_mma_sk4_m5_bf16")?,
+                cuda.get_func("bf12_mma_sk4_m6_bf16")?,
+                cuda.get_func("bf12_mma_sk4_m7_bf16")?,
+                cuda.get_func("bf12_mma_sk4_m8_bf16")?,
+            ],
+            lm_head_mma: [
+                cuda.get_func("lm_head_bf12_mma_argmax_m4_bf16")?,
+                cuda.get_func("lm_head_bf12_mma_argmax_m5_bf16")?,
+                cuda.get_func("lm_head_bf12_mma_argmax_m6_bf16")?,
+                cuda.get_func("lm_head_bf12_mma_argmax_m7_bf16")?,
+                cuda.get_func("lm_head_bf12_mma_argmax_m8_bf16")?,
+            ],
+            lm_head_m1_conf: cuda.get_func("lm_head_bf12_argmax_m1_conf_bf16")?,
+            argmax_s2_conf: cuda.get_func("argmax_stage2_conf_bf16")?,
+            eval_mtp_cond_d2: cuda.get_func("eval_mtp_cond_d2_bf16")?,
         })
     }
 }
@@ -232,6 +260,79 @@ pub(crate) fn launch_skinny_bf12(
     let mut k_i = w.cols as i32;
     let mut eb = w.e_base;
     let mut add_i: i32 = if add_res { 1 } else { 0 };
+
+    // Phase R15 (H1 + H3) Smart Hybrid Dispatch:
+    //   1) M == 1, K == 2560 (dn_in, fa_qkv, gate_up): Persistent Unroll-5 (40 regs, 0 barriers, 668-691 GB/s)
+    //   2) M >= 6 (all shapes) OR (M == 4..=5 && N == 2560): Zero-Sync Pipelined BF12->PTX MMA m16n8k16 (SK=4)
+    //   3) Otherwise (M == 1..=3, or M == 4..=5 wide N >= 10240): R14 1-warp/row scalar BF12
+    if m == 1 && w.cols == 2560 && (w.rows & 7) == 0 {
+        return cuda.launch(
+            bf12.skinny_pers_k2560_m1,
+            (272, 1, 1),
+            (256, 1, 1),
+            &mut [
+                &mut x_p as *mut _ as *mut c_void,
+                &mut sm8 as *mut _ as *mut c_void,
+                &mut exp4 as *mut _ as *mut c_void,
+                &mut rp as *mut _ as *mut c_void,
+                &mut ec as *mut _ as *mut c_void,
+                &mut ev as *mut _ as *mut c_void,
+                &mut y_p as *mut _ as *mut c_void,
+                &mut n_i as *mut _ as *mut c_void,
+                &mut eb as *mut _ as *mut c_void,
+                &mut add_i as *mut _ as *mut c_void,
+            ],
+        );
+    }
+
+    if m == 1 && w.rows == 2560 && w.cols >= 8192 {
+        let grid_x = ((w.rows + 1) / 2) as u32;
+        return cuda.launch(
+            bf12.skinny_4wpr_m1,
+            (grid_x, 1, 1),
+            (256, 1, 1),
+            &mut [
+                &mut x_p as *mut _ as *mut c_void,
+                &mut sm8 as *mut _ as *mut c_void,
+                &mut exp4 as *mut _ as *mut c_void,
+                &mut rp as *mut _ as *mut c_void,
+                &mut ec as *mut _ as *mut c_void,
+                &mut ev as *mut _ as *mut c_void,
+                &mut y_p as *mut _ as *mut c_void,
+                &mut n_i as *mut _ as *mut c_void,
+                &mut k_i as *mut _ as *mut c_void,
+                &mut eb as *mut _ as *mut c_void,
+                &mut add_i as *mut _ as *mut c_void,
+            ],
+        );
+    }
+
+    let use_mma_sk4 = (w.rows & 15) == 0
+        && (w.cols & 63) == 0
+        && (m >= 6 || ((m == 4 || m == 5) && w.rows == 2560));
+
+    if use_mma_sk4 {
+        let grid_x = (w.rows / 16) as u32;
+        return cuda.launch(
+            bf12.mma_sk4[m - 4],
+            (grid_x, 1, 1),
+            (128, 1, 1),
+            &mut [
+                &mut x_p as *mut _ as *mut c_void,
+                &mut sm8 as *mut _ as *mut c_void,
+                &mut exp4 as *mut _ as *mut c_void,
+                &mut rp as *mut _ as *mut c_void,
+                &mut ec as *mut _ as *mut c_void,
+                &mut ev as *mut _ as *mut c_void,
+                &mut y_p as *mut _ as *mut c_void,
+                &mut n_i as *mut _ as *mut c_void,
+                &mut k_i as *mut _ as *mut c_void,
+                &mut eb as *mut _ as *mut c_void,
+                &mut add_i as *mut _ as *mut c_void,
+            ],
+        );
+    }
+
     let grid_x = ((w.rows + 7) / 8) as u32;
     cuda.launch(
         bf12.skinny[m - 1],
@@ -279,10 +380,15 @@ pub(crate) fn launch_lm_head_bf12_argmax(
     let mut vocab_i = w.rows as i32;
     let mut eb = w.e_base;
     let mut nblk: i32 = 1024;
+    let (func, threads) = if m >= 4 {
+        (bf12.lm_head_mma[m - 4], 128u32)
+    } else {
+        (bf12.lm_head[m - 1], 256u32)
+    };
     cuda.launch(
-        bf12.lm_head[m - 1],
+        func,
         (1024, 1, 1),
-        (256, 1, 1),
+        (threads, 1, 1),
         &mut [
             &mut x_p as *mut _ as *mut c_void,
             &mut sm8 as *mut _ as *mut c_void,
@@ -321,6 +427,78 @@ pub(crate) fn launch_lm_head_bf12_argmax(
             ],
         )
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(crate) fn launch_lm_head_bf12_argmax_m1_conf(
+    cuda: &CudaRuntime,
+    bf12: &Bf12DecodeFuncs,
+    x_normed: CUdeviceptr,
+    w: Bf12Ptr,
+    part_vals: CUdeviceptr,
+    part_idxs: CUdeviceptr,
+    part_v2: CUdeviceptr,
+    out_id: CUdeviceptr,
+    out_margin: CUdeviceptr,
+    active_drafts_out: CUdeviceptr,
+    set_active_val: i32,
+    thresh: f32,
+    cond_handle: u64,
+) -> Result<()> {
+    let mut x_p = x_normed;
+    let mut sm8 = w.sm8;
+    let mut exp4 = w.exp4;
+    let mut rp = w.row_ptr;
+    let mut ec = w.esc_col;
+    let mut ev = w.esc_val;
+    let mut av_p = part_vals;
+    let mut ai_p = part_idxs;
+    let mut av2_p = part_v2;
+    let mut vocab_i = w.rows as i32;
+    let mut eb = w.e_base;
+    cuda.launch(
+        bf12.lm_head_m1_conf,
+        (1024, 1, 1),
+        (256, 1, 1),
+        &mut [
+            &mut x_p as *mut _ as *mut c_void,
+            &mut sm8 as *mut _ as *mut c_void,
+            &mut exp4 as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut ec as *mut _ as *mut c_void,
+            &mut ev as *mut _ as *mut c_void,
+            &mut av_p as *mut _ as *mut c_void,
+            &mut ai_p as *mut _ as *mut c_void,
+            &mut av2_p as *mut _ as *mut c_void,
+            &mut vocab_i as *mut _ as *mut c_void,
+            &mut eb as *mut _ as *mut c_void,
+        ],
+    )?;
+    let mut out_p = out_id;
+    let mut margin_p = out_margin;
+    let mut act_p = active_drafts_out;
+    let mut nblk: i32 = 1024;
+    let mut sav: i32 = set_active_val;
+    let mut th: f32 = thresh;
+    let mut ch: u64 = cond_handle;
+    cuda.launch(
+        bf12.argmax_s2_conf,
+        (1, 1, 1),
+        (256, 1, 1),
+        &mut [
+            &mut av_p as *mut _ as *mut c_void,
+            &mut ai_p as *mut _ as *mut c_void,
+            &mut av2_p as *mut _ as *mut c_void,
+            &mut out_p as *mut _ as *mut c_void,
+            &mut margin_p as *mut _ as *mut c_void,
+            &mut act_p as *mut _ as *mut c_void,
+            &mut nblk as *mut _ as *mut c_void,
+            &mut sav as *mut _ as *mut c_void,
+            &mut th as *mut _ as *mut c_void,
+            &mut ch as *mut _ as *mut c_void,
+        ],
+    )
 }
 
 #[inline]
@@ -1489,6 +1667,12 @@ struct MtpRuntime {
     v_mlp_act: CUdeviceptr,   // [5, 9216] bf16
     v_arg_vals: CUdeviceptr,  // [5, 1024] f32 (Phase R14: v_logits freed!)
     v_arg_idxs: CUdeviceptr,  // [5, 1024] i32
+    // Phase R15 (H2): Confidence-Gated Adaptive MTP buffers (+4 KB total!)
+    v_arg_v2: CUdeviceptr,    // [1024] f32
+    d_d1_margin: CUdeviceptr, // [4] f32 (top1-top2 margin per draft step)
+    d_active_drafts: CUdeviceptr, // [1] i32 (actual active draft count 1..=K)
+    conf_thresh: f32,
+    log_cal: bool,
     // MTP single/batch step buffers
     mtp_cat: CUdeviceptr,     // [4, 5120] bf16
     mtp_h: CUdeviceptr,       // [4, 2560] bf16
@@ -1503,13 +1687,16 @@ struct MtpRuntime {
     h_verify_toks: *mut i64,
     h_draft_toks: *mut i64,
     h_mtp_tok: *mut i64,
-    // Phase R7.1: Full-Cycle MTP CUDA Graphs (ONLY 2 graph launches per cycle, 0 eager kernels!)
+    h_active_drafts: *mut i32,
+    h_margins: *mut f32,
+    // Phase R7.1 + R15 (H2): Full-Cycle MTP CUDA Graphs (with optional CUDA 12.8 Conditional IF nodes!)
     draft_and_verify_graph: CUgraphExec,
     commit_and_d1_graphs: Vec<CUgraphExec>, // indexed by accepted in 0..verify_m
     // Stats
     total_drafted: u64,
     total_accepted: u64,
     total_cycles: u64,
+    total_skipped_drafts: u64,
 }
 
 unsafe impl Send for MtpRuntime {}
@@ -1628,6 +1815,7 @@ impl RustSplitEngine {
         split_layer: usize,
         mut max_seq: usize,
         mtp_drafts: usize,
+        mtp_conf_thresh: f32,
         prefix_cache_slots: usize,
         force_max_seq: bool,
         skinny_m4_wide: bool,
@@ -1756,6 +1944,9 @@ impl RustSplitEngine {
                 // Phase R14: v_logits freed (-2.4 MiB) — Verify uses lm_head_bf12_argmax_m{2..5}!
                 let o_vav = mnext(vm * 1024 * 4);
                 let o_vai = mnext(vm * 1024 * 4);
+                let o_vav2 = mnext(1024 * 4);
+                let o_dmar = mnext(4 * 4);
+                let o_dact = mnext(4);
                 let o_mcat = mnext(vm * 5120 * 2);
                 let o_mh = mnext(vm * 2560 * 2);
                 let o_mhn = mnext(vm * 2560 * 2);
@@ -1822,6 +2013,13 @@ impl RustSplitEngine {
                 let h_verify_toks = cuda.alloc_pinned(vm * 8)? as *mut i64;
                 let h_draft_toks = cuda.alloc_pinned(vm * 8)? as *mut i64;
                 let h_mtp_tok = cuda.alloc_pinned(8)? as *mut i64;
+                let h_active_drafts = cuda.alloc_pinned(4)? as *mut i32;
+                let h_margins = cuda.alloc_pinned(4 * 4)? as *mut f32;
+                unsafe {
+                    *h_active_drafts = dk as i32;
+                    for j in 0..4 { *h_margins.add(j) = 0.0; }
+                }
+                let log_cal = std::env::var_os("QWEN_MTP_LOG").is_some();
 
                 Some(MtpRuntime {
                     draft_k: dk,
@@ -1849,6 +2047,11 @@ impl RustSplitEngine {
                     v_mlp_act: arena + o_vac,
                     v_arg_vals: arena + o_vav,
                     v_arg_idxs: arena + o_vai,
+                    v_arg_v2: arena + o_vav2,
+                    d_d1_margin: arena + o_dmar,
+                    d_active_drafts: arena + o_dact,
+                    conf_thresh: mtp_conf_thresh.max(0.0),
+                    log_cal,
                     mtp_cat: arena + o_mcat,
                     mtp_h: arena + o_mh,
                     mtp_h_norm: arena + o_mhn,
@@ -1860,11 +2063,14 @@ impl RustSplitEngine {
                     h_verify_toks,
                     h_draft_toks,
                     h_mtp_tok,
+                    h_active_drafts,
+                    h_margins,
                     draft_and_verify_graph: std::ptr::null_mut(),
                     commit_and_d1_graphs: Vec::new(),
                     total_drafted: 0,
                     total_accepted: 0,
                     total_cycles: 0,
+                    total_skipped_drafts: 0,
                 })
             } else {
                 None
@@ -1962,6 +2168,10 @@ impl RustSplitEngine {
 
     pub fn mtp_drafts(&self) -> usize {
         self.mtp.as_ref().map(|m| m.draft_k).unwrap_or(0)
+    }
+
+    pub fn mtp_skipped_drafts(&self) -> u64 {
+        self.mtp.as_ref().map(|m| m.total_skipped_drafts).unwrap_or(0)
     }
 
     pub fn mtp_stats(&self) -> (u64, u64, f64, f64) {
@@ -2547,13 +2757,34 @@ impl RustSplitEngine {
         Ok(())
     }
 
+    fn launch_eval_mtp_cond_d2(&self, mtp: &MtpRuntime, init_active_val: i32, thresh: f32, cond_handle: u64) -> Result<()> {
+        let mut dmar = mtp.d_d1_margin;
+        let mut dact = mtp.d_active_drafts;
+        let mut init_v = init_active_val;
+        let mut th = thresh;
+        let mut ch = cond_handle;
+        self.cuda.launch(
+            self.funcs.bf12.eval_mtp_cond_d2,
+            (1, 1, 1),
+            (1, 1, 1),
+            &mut [
+                &mut dmar as *mut _ as *mut c_void,
+                &mut dact as *mut _ as *mut c_void,
+                &mut init_v as *mut _ as *mut c_void,
+                &mut th as *mut _ as *mut c_void,
+                &mut ch as *mut _ as *mut c_void,
+            ],
+        )
+    }
+
     fn draft_and_verify_body(&self, mtp: &MtpRuntime) -> Result<()> {
         // Assumes v_tok_ids[0] = cur_tok, mtp.mtp_pos = cur_pos, mtp.v_pos = cur_pos, mtp.mtp_out_tok = d1!
         self.cuda.dtod_async(mtp.v_tok_ids + 8, mtp.mtp_out_tok, 8)?;
+        self.launch_eval_mtp_cond_d2(mtp, mtp.draft_k as i32, 0.0, 0)?;
         let mut mpos_p = mtp.mtp_pos;
         for idx in 1..mtp.draft_k {
             self.cuda.dtod_async(mtp.v_hidden, mtp.mtp_h_norm, 2560 * 2)?;
-            self.run_mtp_step_small_body(1, mtp.mtp_out_tok, mtp.v_hidden)?;
+            self.run_mtp_step_small_body_conf(1, mtp.mtp_out_tok, mtp.v_hidden, idx, 0, 0)?;
             self.cuda.dtod_async(mtp.v_tok_ids + ((idx + 1) * 8) as u64, mtp.mtp_out_tok, 8)?;
             if idx + 1 < mtp.draft_k {
                 self.cuda.launch(
@@ -2564,6 +2795,8 @@ impl RustSplitEngine {
                 )?;
             }
         }
+        self.cuda.dtoh_async(mtp.h_active_drafts as *mut u8, mtp.d_active_drafts, 4)?;
+        self.cuda.dtoh_async(mtp.h_margins as *mut u8, mtp.d_d1_margin, mtp.draft_k * 4)?;
         self.cuda.dtoh_async(mtp.h_draft_toks as *mut u8, mtp.v_tok_ids + 8, mtp.draft_k * 8)?;
         self.verify_body(mtp)?;
         self.cuda.dtoh_async(mtp.h_verify_toks as *mut u8, mtp.v_out_toks, mtp.verify_m * 8)?;
@@ -2571,9 +2804,9 @@ impl RustSplitEngine {
     }
 
     fn capture_verify_graph(&mut self) -> Result<()> {
-        let (verify_m, v_tok_ids, v_pos, mtp_tok_ids, mtp_pos, mtp_out_tok) = {
+        let (draft_k, verify_m, conf_thresh, v_tok_ids, v_pos, mtp_tok_ids, mtp_pos, mtp_out_tok) = {
             let mtp = self.mtp.as_ref().unwrap();
-            (mtp.verify_m, mtp.v_tok_ids, mtp.v_pos, mtp.mtp_tok_ids, mtp.mtp_pos, mtp.mtp_out_tok)
+            (mtp.draft_k, mtp.verify_m, mtp.conf_thresh, mtp.v_tok_ids, mtp.v_pos, mtp.mtp_tok_ids, mtp.mtp_pos, mtp.mtp_out_tok)
         };
         let toks = [1i64; 5];
         let one_tok: i64 = 1;
@@ -2584,7 +2817,7 @@ impl RustSplitEngine {
         self.cuda.htod_sync(v_pos, &pos_init as *const i32 as *const u8, 4)?;
         self.cuda.htod_sync(mtp_pos, &pos_init as *const i32 as *const u8, 4)?;
 
-        // 1. Capture Unified `draft_and_verify_graph` (d2..dK + Verify M=4 + async D2H of drafts & verified toks!)
+        // 1. Capture Unified `draft_and_verify_graph` (with optional CUDA 12.8 Conditional IF nodes for H2!)
         for _ in 0..2 {
             self.cuda.htod_sync(mtp_pos, &pos_init as *const i32 as *const u8, 4)?;
             let mtp = self.mtp.as_ref().unwrap();
@@ -2592,12 +2825,75 @@ impl RustSplitEngine {
         }
         self.cuda.sync()?;
         self.cuda.htod_sync(mtp_pos, &pos_init as *const i32 as *const u8, 4)?;
-        self.cuda.begin_capture()?;
-        {
+
+        let dv_exec = if conf_thresh > 0.0 && draft_k >= 2 {
             let mtp = self.mtp.as_ref().unwrap();
-            self.draft_and_verify_body(mtp)?;
-        }
-        let dv_exec = self.cuda.end_capture_and_instantiate()?;
+            let parent = self.cuda.create_graph()?;
+            let mut cond_handles = Vec::with_capacity(draft_k - 1);
+            for _ in 1..draft_k {
+                cond_handles.push(self.cuda.graph_create_cond_handle(parent, 0)?);
+            }
+
+            // Prefix node: copy d1 -> v_tok_ids[1], init d_active_drafts = 1, evaluate cond_d2 from d1_margin!
+            self.cuda.begin_capture()?;
+            self.cuda.dtod_async(mtp.v_tok_ids + 8, mtp.mtp_out_tok, 8)?;
+            self.launch_eval_mtp_cond_d2(mtp, 1, conf_thresh, cond_handles[0])?;
+            let g_prefix = self.cuda.end_capture_graph()?;
+            let n_prefix = self.cuda.graph_add_child_node(parent, &[], g_prefix)?;
+            self.cuda.destroy_graph(g_prefix);
+
+            // Nested IF chain for d2..=dK (if d2 is skipped, d3..dK are automatically skipped!)
+            let mut cur_parent = parent;
+            let mut cur_deps = vec![n_prefix];
+            let mut n_outer_if = n_prefix;
+            let mut mpos_p = mtp.mtp_pos;
+            for idx in 1..draft_k {
+                let (n_if, body_g) = self.cuda.graph_add_if_node(cur_parent, &cur_deps, cond_handles[idx - 1])?;
+                if idx == 1 {
+                    n_outer_if = n_if;
+                }
+                let next_cond = if idx + 1 < draft_k { cond_handles[idx] } else { 0 };
+                self.cuda.begin_capture()?;
+                self.cuda.dtod_async(mtp.v_hidden, mtp.mtp_h_norm, 2560 * 2)?;
+                self.run_mtp_step_small_body_conf(1, mtp.mtp_out_tok, mtp.v_hidden, idx, (idx + 1) as i32, next_cond)?;
+                self.cuda.dtod_async(mtp.v_tok_ids + ((idx + 1) * 8) as u64, mtp.mtp_out_tok, 8)?;
+                if idx + 1 < draft_k {
+                    self.cuda.launch(
+                        self.funcs.inc_pos,
+                        (1, 1, 1),
+                        (1, 1, 1),
+                        &mut [&mut mpos_p as *mut _ as *mut c_void],
+                    )?;
+                }
+                let g_step = self.cuda.end_capture_graph()?;
+                let n_step = self.cuda.graph_add_child_node(body_g, &[], g_step)?;
+                self.cuda.destroy_graph(g_step);
+                cur_parent = body_g;
+                cur_deps = vec![n_step];
+            }
+
+            // Suffix node: async D2H of active_drafts + margins + draft_toks -> Verify M -> async D2H of verify_toks!
+            self.cuda.begin_capture()?;
+            self.cuda.dtoh_async(mtp.h_active_drafts as *mut u8, mtp.d_active_drafts, 4)?;
+            self.cuda.dtoh_async(mtp.h_margins as *mut u8, mtp.d_d1_margin, draft_k * 4)?;
+            self.cuda.dtoh_async(mtp.h_draft_toks as *mut u8, mtp.v_tok_ids + 8, draft_k * 8)?;
+            self.verify_body(mtp)?;
+            self.cuda.dtoh_async(mtp.h_verify_toks as *mut u8, mtp.v_out_toks, verify_m * 8)?;
+            let g_suffix = self.cuda.end_capture_graph()?;
+            let _n_suffix = self.cuda.graph_add_child_node(parent, &[n_outer_if], g_suffix)?;
+            self.cuda.destroy_graph(g_suffix);
+
+            let exec = self.cuda.instantiate_graph(parent)?;
+            self.cuda.destroy_graph(parent);
+            exec
+        } else {
+            self.cuda.begin_capture()?;
+            {
+                let mtp = self.mtp.as_ref().unwrap();
+                self.draft_and_verify_body(mtp)?;
+            }
+            self.cuda.end_capture_and_instantiate()?
+        };
         self.cuda.sync()?;
 
         // 2. Capture `commit_and_d1_graphs[accepted]` for accepted = 0..verify_m (Commit DeltaNet + MTP d1!)
@@ -2676,6 +2972,18 @@ impl RustSplitEngine {
         m: usize,
         tok_ids_gpu: CUdeviceptr,
         hid_gpu: CUdeviceptr,
+    ) -> Result<()> {
+        self.run_mtp_step_small_body_conf(m, tok_ids_gpu, hid_gpu, 0, 0, 0)
+    }
+
+    fn run_mtp_step_small_body_conf(
+        &self,
+        m: usize,
+        tok_ids_gpu: CUdeviceptr,
+        hid_gpu: CUdeviceptr,
+        margin_slot: usize,
+        set_active_val: i32,
+        cond_handle: u64,
     ) -> Result<()> {
         let mtp = self.mtp.as_ref().unwrap();
         let mw = mtp.weights;
@@ -2831,7 +3139,21 @@ impl RustSplitEngine {
                 &mut eps as *mut _ as *mut c_void,
             ],
         )?;
-        self.launch_lm_head_argmax(1, mtp.mtp_h_norm, mtp.v_arg_vals, mtp.v_arg_idxs, mtp.mtp_out_tok)?;
+        launch_lm_head_bf12_argmax_m1_conf(
+            &self.cuda,
+            &self.funcs.bf12,
+            mtp.mtp_h_norm,
+            self.weights.lm_head_w,
+            mtp.v_arg_vals,
+            mtp.v_arg_idxs,
+            mtp.v_arg_v2,
+            mtp.mtp_out_tok,
+            mtp.d_d1_margin + (margin_slot * 4) as u64,
+            mtp.d_active_drafts,
+            set_active_val,
+            mtp.conf_thresh,
+            cond_handle,
+        )?;
         Ok(())
     }
 
@@ -3080,7 +3402,21 @@ impl RustSplitEngine {
                 &mut eps as *mut _ as *mut c_void,
             ],
         )?;
-        self.launch_lm_head_argmax(1, mtp.mtp_h_norm, mtp.v_arg_vals, mtp.v_arg_idxs, mtp.mtp_out_tok)?;
+        launch_lm_head_bf12_argmax_m1_conf(
+            &self.cuda,
+            &self.funcs.bf12,
+            mtp.mtp_h_norm,
+            self.weights.lm_head_w,
+            mtp.v_arg_vals,
+            mtp.v_arg_idxs,
+            mtp.v_arg_v2,
+            mtp.mtp_out_tok,
+            mtp.d_d1_margin,
+            0,
+            0,
+            mtp.conf_thresh,
+            0,
+        )?;
         Ok(0)
     }
 
@@ -3475,7 +3811,7 @@ impl RustSplitEngine {
                         )?;
                     }
 
-                    if sub_len >= 192 {
+                    if sub_len >= 128 {
                         run_deltanet_prefill_wy(
                             &self.cuda,
                             &self.funcs.wy,
@@ -4052,31 +4388,41 @@ impl RustSplitEngine {
             while emitted < max_new_tokens {
                 // Single sync per cycle: reads BOTH drafts d1..dK and verified v_toks[0..M]!
                 self.cuda.sync()?;
-                let (draft_k, _verify_m, drafts, v_toks) = {
+                let (draft_k, active_k, _verify_m, drafts, v_toks, margins, log_cal) = {
                     let m = self.mtp.as_ref().unwrap();
                     let mut d = [0i64; 4];
                     let mut v = [0i64; 5];
+                    let mut mar = [0.0f32; 4];
+                    let ak = unsafe { (*m.h_active_drafts as usize).clamp(1, m.draft_k) };
                     unsafe {
                         for i in 0..m.draft_k {
                             d[i] = *m.h_draft_toks.add(i);
+                            mar[i] = *m.h_margins.add(i);
                         }
                         for i in 0..m.verify_m {
                             v[i] = *m.h_verify_toks.add(i);
                         }
                     }
-                    (m.draft_k, m.verify_m, d, v)
+                    (m.draft_k, ak, m.verify_m, d, v, mar, m.log_cal)
                 };
 
-                // Exact Greedy Verification
+                // Exact Greedy Verification (strictly bounded by active_k -> 100.000% Bit-Exact!)
                 let mut accepted = 0usize;
-                while accepted < draft_k && drafts[accepted] == v_toks[accepted] {
+                while accepted < active_k && drafts[accepted] == v_toks[accepted] {
                     accepted += 1;
+                }
+                if log_cal {
+                    eprintln!(
+                        "MTP_CAL k={draft_k} active={active_k} acc={accepted} m0={:.3} m1={:.3} m2={:.3}",
+                        margins[0], margins[1], margins[2]
+                    );
                 }
                 let num_new = accepted + 1;
                 if let Some(m) = self.mtp.as_mut() {
-                    m.total_drafted += draft_k as u64;
+                    m.total_drafted += active_k as u64;
                     m.total_accepted += accepted as u64;
                     m.total_cycles += 1;
+                    m.total_skipped_drafts += (draft_k - active_k) as u64;
                 }
 
                 // Determine if we stop within this cycle
@@ -4284,29 +4630,39 @@ impl RustSplitEngine {
 
         while emitted < 64 {
             self.cuda.sync()?;
-            let (draft_k, drafts, v_toks) = {
+            let (draft_k, active_k, drafts, v_toks, margins, log_cal) = {
                 let m = self.mtp.as_ref().unwrap();
                 let mut d = [0i64; 4];
                 let mut v = [0i64; 5];
+                let mut mar = [0.0f32; 4];
+                let ak = unsafe { (*m.h_active_drafts as usize).clamp(1, m.draft_k) };
                 unsafe {
                     for i in 0..m.draft_k {
                         d[i] = *m.h_draft_toks.add(i);
+                        mar[i] = *m.h_margins.add(i);
                     }
                     for i in 0..m.verify_m {
                         v[i] = *m.h_verify_toks.add(i);
                     }
                 }
-                (m.draft_k, d, v)
+                (m.draft_k, ak, d, v, mar, m.log_cal)
             };
             let mut accepted = 0usize;
-            while accepted < draft_k && drafts[accepted] == v_toks[accepted] {
+            while accepted < active_k && drafts[accepted] == v_toks[accepted] {
                 accepted += 1;
+            }
+            if log_cal {
+                eprintln!(
+                    "MTP_CAL k={draft_k} active={active_k} acc={accepted} m0={:.3} m1={:.3} m2={:.3}",
+                    margins[0], margins[1], margins[2]
+                );
             }
             let num_new = accepted + 1;
             if let Some(m) = self.mtp.as_mut() {
-                m.total_drafted += draft_k as u64;
+                m.total_drafted += active_k as u64;
                 m.total_accepted += accepted as u64;
                 m.total_cycles += 1;
+                m.total_skipped_drafts += (draft_k - active_k) as u64;
             }
             emitted += num_new;
             cycles += 1;

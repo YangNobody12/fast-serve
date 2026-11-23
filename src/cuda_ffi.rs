@@ -18,6 +18,29 @@ pub type CUstream = *mut c_void;
 pub type CUevent = *mut c_void;
 pub type CUgraph = *mut c_void;
 pub type CUgraphExec = *mut c_void;
+pub type CUgraphNode = *mut c_void;
+pub type CUgraphConditionalHandle = u64;
+
+pub const CU_GRAPH_NODE_TYPE_CONDITIONAL: c_uint = 13;
+pub const CU_GRAPH_COND_TYPE_IF: c_uint = 0;
+pub const CU_GRAPH_COND_ASSIGN_DEFAULT: c_uint = 1;
+
+#[repr(C)]
+pub struct CUDA_CONDITIONAL_NODE_PARAMS {
+    pub handle: CUgraphConditionalHandle,
+    pub cond_type: c_uint,
+    pub size: c_uint,
+    pub phGraph_out: *mut CUgraph,
+    pub ctx: CUcontext,
+}
+
+#[repr(C)]
+pub struct CUgraphNodeParamsCond {
+    pub node_type: c_uint,
+    pub reserved0: [c_int; 3],
+    pub conditional: CUDA_CONDITIONAL_NODE_PARAMS,
+    pub pad: [u64; 26], // Total 16 + 32 + 208 = 256 bytes (verified against CUDA 12.8 cuda.h!)
+}
 
 pub type CublasStatus = c_int;
 pub type CublasHandle = *mut c_void;
@@ -77,6 +100,10 @@ type FnCuGraphInstantiateWithFlags = unsafe extern "C" fn(*mut CUgraphExec, CUgr
 type FnCuGraphLaunch = unsafe extern "C" fn(CUgraphExec, CUstream) -> CUresult;
 type FnCuGraphDestroy = unsafe extern "C" fn(CUgraph) -> CUresult;
 type FnCuGraphExecDestroy = unsafe extern "C" fn(CUgraphExec) -> CUresult;
+type FnCuGraphCreate = unsafe extern "C" fn(*mut CUgraph, c_uint) -> CUresult;
+type FnCuGraphAddChildGraphNode = unsafe extern "C" fn(*mut CUgraphNode, CUgraph, *const CUgraphNode, usize, CUgraph) -> CUresult;
+type FnCuGraphConditionalHandleCreate = unsafe extern "C" fn(*mut CUgraphConditionalHandle, CUgraph, CUcontext, c_uint, c_uint) -> CUresult;
+type FnCuGraphAddNode = unsafe extern "C" fn(*mut CUgraphNode, CUgraph, *const CUgraphNode, usize, *mut CUgraphNodeParamsCond) -> CUresult;
 type FnCuProfilerStart = unsafe extern "C" fn() -> CUresult;
 type FnCuProfilerStop = unsafe extern "C" fn() -> CUresult;
 type FnCuEventCreate = unsafe extern "C" fn(*mut CUevent, c_uint) -> CUresult;
@@ -147,6 +174,10 @@ pub struct CudaRuntime {
     cuGraphLaunch: FnCuGraphLaunch,
     cuGraphDestroy: FnCuGraphDestroy,
     cuGraphExecDestroy: FnCuGraphExecDestroy,
+    cuGraphCreate: FnCuGraphCreate,
+    cuGraphAddChildGraphNode: FnCuGraphAddChildGraphNode,
+    cuGraphConditionalHandleCreate: FnCuGraphConditionalHandleCreate,
+    cuGraphAddNode: FnCuGraphAddNode,
     cuProfilerStart: FnCuProfilerStart,
     cuProfilerStop: FnCuProfilerStop,
     cuEventCreate: FnCuEventCreate,
@@ -203,6 +234,12 @@ impl CudaRuntime {
             let cuGraphLaunch: FnCuGraphLaunch = *cuda_lib.get(b"cuGraphLaunch\0")?;
             let cuGraphDestroy: FnCuGraphDestroy = *cuda_lib.get(b"cuGraphDestroy\0")?;
             let cuGraphExecDestroy: FnCuGraphExecDestroy = *cuda_lib.get(b"cuGraphExecDestroy\0")?;
+            let cuGraphCreate: FnCuGraphCreate = *cuda_lib.get(b"cuGraphCreate\0")?;
+            let cuGraphAddChildGraphNode: FnCuGraphAddChildGraphNode =
+                *cuda_lib.get(b"cuGraphAddChildGraphNode\0")?;
+            let cuGraphConditionalHandleCreate: FnCuGraphConditionalHandleCreate =
+                *cuda_lib.get(b"cuGraphConditionalHandleCreate\0")?;
+            let cuGraphAddNode: FnCuGraphAddNode = *cuda_lib.get(b"cuGraphAddNode\0")?;
             let cuProfilerStart: FnCuProfilerStart = *cuda_lib.get(b"cuProfilerStart\0")?;
             let cuProfilerStop: FnCuProfilerStop = *cuda_lib.get(b"cuProfilerStop\0")?;
             let cuEventCreate: FnCuEventCreate = *cuda_lib.get(b"cuEventCreate\0")?;
@@ -274,6 +311,10 @@ impl CudaRuntime {
                 cuGraphLaunch,
                 cuGraphDestroy,
                 cuGraphExecDestroy,
+                cuGraphCreate,
+                cuGraphAddChildGraphNode,
+                cuGraphConditionalHandleCreate,
+                cuGraphAddNode,
                 cuProfilerStart,
                 cuProfilerStop,
                 cuEventCreate,
@@ -630,6 +671,106 @@ impl CudaRuntime {
             let _ = (self.cuGraphDestroy)(graph);
         }
         Ok(exec)
+    }
+
+    pub fn end_capture_graph(&self) -> Result<CUgraph> {
+        let mut graph: CUgraph = ptr::null_mut();
+        unsafe {
+            check_cu((self.cuStreamEndCapture)(self.stream, &mut graph), "cuStreamEndCapture")?;
+        }
+        Ok(graph)
+    }
+
+    pub fn create_graph(&self) -> Result<CUgraph> {
+        let mut graph: CUgraph = ptr::null_mut();
+        unsafe { check_cu((self.cuGraphCreate)(&mut graph, 0), "cuGraphCreate")? };
+        Ok(graph)
+    }
+
+    pub fn destroy_graph(&self, graph: CUgraph) {
+        if !graph.is_null() {
+            unsafe { let _ = (self.cuGraphDestroy)(graph); }
+        }
+    }
+
+    pub fn instantiate_graph(&self, graph: CUgraph) -> Result<CUgraphExec> {
+        let mut exec: CUgraphExec = ptr::null_mut();
+        unsafe {
+            check_cu(
+                (self.cuGraphInstantiateWithFlags)(&mut exec, graph, 0),
+                "cuGraphInstantiateWithFlags",
+            )?;
+        }
+        Ok(exec)
+    }
+
+    pub fn graph_add_child_node(
+        &self,
+        parent: CUgraph,
+        deps: &[CUgraphNode],
+        child: CUgraph,
+    ) -> Result<CUgraphNode> {
+        let mut node: CUgraphNode = ptr::null_mut();
+        let dep_ptr = if deps.is_empty() { ptr::null() } else { deps.as_ptr() };
+        unsafe {
+            check_cu(
+                (self.cuGraphAddChildGraphNode)(&mut node, parent, dep_ptr, deps.len(), child),
+                "cuGraphAddChildGraphNode",
+            )?;
+        }
+        Ok(node)
+    }
+
+    pub fn graph_create_cond_handle(
+        &self,
+        parent: CUgraph,
+        default_val: u32,
+    ) -> Result<CUgraphConditionalHandle> {
+        let mut handle: CUgraphConditionalHandle = 0;
+        unsafe {
+            check_cu(
+                (self.cuGraphConditionalHandleCreate)(
+                    &mut handle,
+                    parent,
+                    self.ctx,
+                    default_val,
+                    CU_GRAPH_COND_ASSIGN_DEFAULT,
+                ),
+                "cuGraphConditionalHandleCreate",
+            )?;
+        }
+        Ok(handle)
+    }
+
+    pub fn graph_add_if_node(
+        &self,
+        parent: CUgraph,
+        deps: &[CUgraphNode],
+        handle: CUgraphConditionalHandle,
+    ) -> Result<(CUgraphNode, CUgraph)> {
+        debug_assert_eq!(std::mem::size_of::<CUgraphNodeParamsCond>(), 256);
+        let mut node: CUgraphNode = ptr::null_mut();
+        let mut params = CUgraphNodeParamsCond {
+            node_type: CU_GRAPH_NODE_TYPE_CONDITIONAL,
+            reserved0: [0; 3],
+            conditional: CUDA_CONDITIONAL_NODE_PARAMS {
+                handle,
+                cond_type: CU_GRAPH_COND_TYPE_IF,
+                size: 1,
+                phGraph_out: ptr::null_mut(),
+                ctx: self.ctx,
+            },
+            pad: [0u64; 26],
+        };
+        let dep_ptr = if deps.is_empty() { ptr::null() } else { deps.as_ptr() };
+        unsafe {
+            check_cu(
+                (self.cuGraphAddNode)(&mut node, parent, dep_ptr, deps.len(), &mut params),
+                "cuGraphAddNode(CONDITIONAL_IF)",
+            )?;
+            let body_graph = *params.conditional.phGraph_out;
+            Ok((node, body_graph))
+        }
     }
 
     pub fn launch_graph(&self, exec: CUgraphExec) -> Result<()> {

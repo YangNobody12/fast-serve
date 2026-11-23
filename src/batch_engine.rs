@@ -1,5 +1,7 @@
-//! Phase R7: Iteration-Level Continuous Batching Engine + Paged KV Block Manager (B = 1..4).
-//! Shares ONE 8.0 GB weight read across up to 4 concurrent users (~240-260 tok/s total on RTX 3080)!
+//! Phase R7 + R15 (H3): Iteration-Level Continuous Batching Engine + Paged KV Block Manager (B = 1..8).
+//! Shares ONE 6.02 GB BF12-Lossless weight read across up to 8 concurrent users via PTX MMA Tensor Cores!
+
+pub const MAX_BATCH: usize = 8;
 
 use anyhow::Result;
 use std::collections::VecDeque;
@@ -197,7 +199,7 @@ impl BatchGpuEngine {
         prefill_int8: PrefillInt8Mode,
     ) -> Result<Self> {
         let t0 = Instant::now();
-        let max_batch = max_batch.clamp(1, 4);
+        let max_batch = max_batch.clamp(1, MAX_BATCH);
         let max_seq = max_seq.clamp(256, MAX_BLOCKS_PER_SEQ * KV_BLOCK_SIZE);
         let cfg = TextConfig::load(model_dir)?;
         let tok = QwenTokenizer::load(model_dir, cfg.eos_token_id)?;
@@ -219,14 +221,13 @@ impl BatchGpuEngine {
             if l.is_linear { p2_sub_idx.push(lin_c); lin_c += 1; } else { p2_sub_idx.push(fa_c); fa_c += 1; }
         }
 
-        // Auto WDDM VRAM Headroom Guard for Paged KV Pool!
+        // Auto WDDM VRAM Headroom Guard for Paged KV Pool (scales smoothly up to B=8 -> 512 blocks = 8192 pooled tok)!
         let (free_b, _) = cuda.mem_info()?;
         let free_mib = free_b as f64 / 1048576.0;
         let dn_mib = (max_batch as f64) * 49.5;
-        let fixed_mib = dn_mib + 56.0 + 90.0 + 12.0 + 1.0; // DeltaNet + pf_arena (55.6) + w_unpack (90) + scratch + RoPE
+        let fixed_mib = dn_mib + 56.0 + 90.0 + 24.0 + 1.0; // DeltaNet + pf_arena (55.6) + w_unpack (90) + scratch + RoPE
         let wddm_guard_mib = 380.0;
-        // Desired pooled blocks: enough for 4096 tokens (256 blocks = 128 MiB) or capped to stay WDDM-safe!
-        let desired_blocks = (max_seq.max(2048) * 2 / KV_BLOCK_SIZE).clamp(128, 256);
+        let desired_blocks = (max_seq.max(2048) * (max_batch.max(4) / 2) / KV_BLOCK_SIZE).clamp(128, 512);
         let num_blocks = if force_max_seq {
             desired_blocks
         } else {
@@ -256,7 +257,7 @@ impl BatchGpuEngine {
         cuda.htod_sync(cos_table, cos_h.as_ptr() as *const u8, tbl_bytes)?;
         cuda.htod_sync(sin_table, sin_h.as_ptr() as *const u8, tbl_bytes)?;
 
-        // Batched Decode Scratch Arena (B_max = 4)
+        // Batched Decode Scratch Arena (B_max = MAX_BATCH = 8)
         let align = |b: usize| (b + 255) & !255;
         let mut off = 0usize;
         let mut next = |b: usize| {
@@ -265,31 +266,31 @@ impl BatchGpuEngine {
             cur as u64
         };
         // Pack [tok_ids | positions | slot_ids | block_tables] contiguously at offset 0 for 1 pinned HtoD!
-        let o_tok = next(4 * 8);
-        let o_pos = next(4 * 4);
-        let o_slt = next(4 * 4);
-        let o_bt  = next(4 * MAX_BLOCKS_PER_SEQ * 4);
-        let o_out = next(4 * 8);
+        let o_tok = next(MAX_BATCH * 8);
+        let o_pos = next(MAX_BATCH * 4);
+        let o_slt = next(MAX_BATCH * 4);
+        let o_bt  = next(MAX_BATCH * MAX_BLOCKS_PER_SEQ * 4);
+        let o_out = next(MAX_BATCH * 8);
         let meta_bytes = o_out as usize;
-        let o_hid = next(4 * 2560 * 2);
-        let o_br  = next(4 * 2560 * 2);
-        let o_nrm = next(4 * 2560 * 2);
-        let o_del = next(4 * 2560 * 2);
-        let o_dn  = next(4 * 12352 * 2);
-        let o_cv  = next(4 * 8192 * 2);
-        let o_co  = next(4 * 4096 * 2);
-        let o_fa  = next(4 * 10240 * 2);
-        let o_qr  = next(4 * 16 * 256 * 2);
-        let o_fo  = next(4 * 16 * 4 * 256 * 4);
-        let o_fm  = next(4 * 16 * 4 * 2 * 4);
-        let o_gu  = next(4 * 18432 * 2);
-        let o_ac  = next(4 * 9216 * 2);
-        // Phase R14: d_logits freed (-1.9 MiB) — Batch Decode uses lm_head_bf12_argmax_m{1..4}!
-        let o_av  = next(4 * 1024 * 4);
-        let o_ai  = next(4 * 1024 * 4);
+        let o_hid = next(MAX_BATCH * 2560 * 2);
+        let o_br  = next(MAX_BATCH * 2560 * 2);
+        let o_nrm = next(MAX_BATCH * 2560 * 2);
+        let o_del = next(MAX_BATCH * 2560 * 2);
+        let o_dn  = next(MAX_BATCH * 12352 * 2);
+        let o_cv  = next(MAX_BATCH * 8192 * 2);
+        let o_co  = next(MAX_BATCH * 4096 * 2);
+        let o_fa  = next(MAX_BATCH * 10240 * 2);
+        let o_qr  = next(MAX_BATCH * 16 * 256 * 2);
+        let o_fo  = next(MAX_BATCH * 16 * 4 * 256 * 4);
+        let o_fm  = next(MAX_BATCH * 16 * 4 * 2 * 4);
+        let o_gu  = next(MAX_BATCH * 18432 * 2);
+        let o_ac  = next(MAX_BATCH * 9216 * 2);
+        // Phase R14 + R15: d_logits freed — Batch Decode uses BF12 + PTX MMA lm_head_argmax for B=1..8!
+        let o_av  = next(MAX_BATCH * 1024 * 4);
+        let o_ai  = next(MAX_BATCH * 1024 * 4);
         let scratch_arena = cuda.alloc(off)?;
         cuda.memset_zero_async(scratch_arena, off)?;
-        let h_out_toks = cuda.alloc_pinned(4 * 8)? as *mut i64;
+        let h_out_toks = cuda.alloc_pinned(MAX_BATCH * 8)? as *mut i64;
         let h_meta_pinned = cuda.alloc_pinned(meta_bytes)?;
         unsafe { std::ptr::write_bytes(h_meta_pinned, 0, meta_bytes); }
 
@@ -360,12 +361,12 @@ impl BatchGpuEngine {
     }
 
     fn capture_batch_decode_graphs(&mut self) -> Result<()> {
-        let toks = [1i64; 4];
-        let pos = [8i32; 4];
+        let toks = [1i64; MAX_BATCH];
+        let pos = [8i32; MAX_BATCH];
         let slots: Vec<i32> = (0..self.max_batch as i32).collect();
-        let bts = vec![0i32; 4 * MAX_BLOCKS_PER_SEQ];
-        self.cuda.htod_sync(self.d_tok_ids, toks.as_ptr() as *const u8, 4 * 8)?;
-        self.cuda.htod_sync(self.d_positions, pos.as_ptr() as *const u8, 4 * 4)?;
+        let bts = vec![0i32; MAX_BATCH * MAX_BLOCKS_PER_SEQ];
+        self.cuda.htod_sync(self.d_tok_ids, toks.as_ptr() as *const u8, MAX_BATCH * 8)?;
+        self.cuda.htod_sync(self.d_positions, pos.as_ptr() as *const u8, MAX_BATCH * 4)?;
         self.cuda.htod_sync(self.d_slot_ids, slots.as_ptr() as *const u8, self.max_batch * 4)?;
         self.cuda.htod_sync(self.d_block_tables, bts.as_ptr() as *const u8, bts.len() * 4)?;
         self.cuda.sync()?;
@@ -518,7 +519,7 @@ impl BatchGpuEngine {
                         )?;
                     }
 
-                    if sub_len >= 192 {
+                    if sub_len >= 128 {
                         run_deltanet_prefill_wy(
                             &self.cuda,
                             &self.funcs.wy,
@@ -1023,14 +1024,14 @@ impl BatchGpuEngine {
         Ok(())
     }
 
-    /// Execute 1 Batched Decode Step for B = 1..4 concurrent requests via 1 PINNED HtoD + 1 CUDA GRAPH LAUNCH!
+    /// Execute 1 Batched Decode Step for B = 1..8 concurrent requests via 1 PINNED HtoD + 1 CUDA GRAPH LAUNCH!
     pub fn decode_step_batch(
         &self,
         tok_ids: &[i64],
         positions: &[i32],
         slot_ids: &[i32],
         block_tables: &[&[i32]],
-    ) -> Result<[i64; 4]> {
+    ) -> Result<[i64; MAX_BATCH]> {
         let b = tok_ids.len();
         unsafe {
             std::ptr::copy_nonoverlapping(tok_ids.as_ptr() as *const u8, self.h_meta_pinned, b * 8);
@@ -1049,7 +1050,7 @@ impl BatchGpuEngine {
         self.cuda.launch_graph(self.decode_graphs[b - 1])?;
         self.cuda.sync()?;
 
-        let mut out = [0i64; 4];
+        let mut out = [0i64; MAX_BATCH];
         unsafe {
             for i in 0..b {
                 out[i] = *self.h_out_toks.add(i);
@@ -1292,9 +1293,9 @@ fn run_scheduler_loop(
 
         // 4. Execute ONE Batched Decode Step for ALL B active requests simultaneously!
         let b = active.len();
-        let mut tok_ids = [0i64; 4];
-        let mut positions = [0i32; 4];
-        let mut slot_ids = [0i32; 4];
+        let mut tok_ids = [0i64; MAX_BATCH];
+        let mut positions = [0i32; MAX_BATCH];
+        let mut slot_ids = [0i32; MAX_BATCH];
         for (i, seq) in active.iter().enumerate() {
             tok_ids[i] = seq.cur_tok;
             positions[i] = seq.pos as i32;

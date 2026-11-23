@@ -3,6 +3,7 @@
 // 100% pure BF16 weights / FP32 recurrent state (zero model modifications)
 
 #include <stdint.h>
+#include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <mma.h>
 
@@ -5175,6 +5176,738 @@ extern "C" __global__ void bf12_to_bf16_unpack(
         dst_row[esc_col[idx]] = esc_val[idx];
     }
 }
+
+// ============================================================================
+// 19. PHASE R15 (H1 + H3): PERSISTENT M=1 K=2560 + ZERO-SYNC PIPELINED
+//     BF12 -> PTX MMA m16n8k16 TENSOR CORE DECODE & LM_HEAD (M = 4..8, SK = 4!)
+//     Strictly 100.000% Bit-Exact BF16 (exact CSR escape patch), 0 bytes spill!
+// ============================================================================
+
+__device__ __forceinline__ void r15_ldmatrix_x4(
+    unsigned int& r0, unsigned int& r1, unsigned int& r2, unsigned int& r3, const void* ptr
+) {
+    unsigned int addr = static_cast<unsigned int>(__cvta_generic_to_shared(ptr));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+
+__device__ __forceinline__ void r15_mma_m16n8k16_bf16(
+    float& d0, float& d1, float& d2, float& d3,
+    unsigned int a0, unsigned int a1, unsigned int a2, unsigned int a3,
+    unsigned int b0, unsigned int b1,
+    float c0, float c1, float c2, float c3
+) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
+          "f"(c0), "f"(c1), "f"(c2), "f"(c3)
+    );
+}
+
+__device__ __forceinline__ int r15_swz64_bf16(int row, int col8) {
+    return (col8 ^ (row & 7)) << 3;
+}
+
+// 19.1 Persistent-Row Compile-Time K=2560 Unroll-5 BF12 GEMV (M = 1, 0 barriers, ~40 regs, 0 spill!)
+// Grid: (272, 1, 1) [4 blocks/SM x 68 SMs], Block: (256, 1, 1)
+extern "C" __global__ void skinny_bf12_pers_k2560_m1_bf16(
+    const bf16_t* __restrict__ X,
+    const unsigned char* __restrict__ W_sm8,
+    const unsigned char* __restrict__ W_exp4,
+    const int* __restrict__ esc_row_ptr,
+    const unsigned short* __restrict__ esc_col,
+    const bf16_t* __restrict__ esc_val,
+    bf16_t* __restrict__ Y,
+    int N,
+    unsigned int e_base,
+    int add_res
+) {
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lane = tid & 31;
+    int total_warps = gridDim.x * 8;
+    int gwid = blockIdx.x * 8 + wid;
+    const uint2* x_u2 = reinterpret_cast<const uint2*>(X);
+
+    for (int n = gwid; n < N; n += total_warps) {
+        const uint4* sm_row = reinterpret_cast<const uint4*>(W_sm8 + (size_t)n * 2560);
+        const uint2* ex_row = reinterpret_cast<const uint2*>(W_exp4 + (size_t)n * 1280);
+        float acc = 0.0f;
+
+        #pragma unroll
+        for (int s = 0; s < 5; ++s) {
+            int kv = s * 32 + lane;
+            uint4 sm16 = r13_ldcs_uint4(&sm_row[kv]);
+            uint2 ex16 = r14_ldcs_uint2(&ex_row[kv]);
+            float wf[4];
+
+            r14_decode_bf12_4f(sm16.x, ex16.x & 0xFFFFu, e_base, wf);
+            {
+                uint2 x2 = __ldg(&x_u2[kv * 4 + 0]);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.x & 0xFFFFu)), wf[0], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.x >> 16)),     wf[1], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.y & 0xFFFFu)), wf[2], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.y >> 16)),     wf[3], acc);
+            }
+            r14_decode_bf12_4f(sm16.y, ex16.x >> 16, e_base, wf);
+            {
+                uint2 x2 = __ldg(&x_u2[kv * 4 + 1]);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.x & 0xFFFFu)), wf[0], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.x >> 16)),     wf[1], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.y & 0xFFFFu)), wf[2], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.y >> 16)),     wf[3], acc);
+            }
+            r14_decode_bf12_4f(sm16.z, ex16.y & 0xFFFFu, e_base, wf);
+            {
+                uint2 x2 = __ldg(&x_u2[kv * 4 + 2]);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.x & 0xFFFFu)), wf[0], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.x >> 16)),     wf[1], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.y & 0xFFFFu)), wf[2], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.y >> 16)),     wf[3], acc);
+            }
+            r14_decode_bf12_4f(sm16.w, ex16.y >> 16, e_base, wf);
+            {
+                uint2 x2 = __ldg(&x_u2[kv * 4 + 3]);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.x & 0xFFFFu)), wf[0], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.x >> 16)),     wf[1], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.y & 0xFFFFu)), wf[2], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.y >> 16)),     wf[3], acc);
+            }
+        }
+        int es = esc_row_ptr[n];
+        int ee = esc_row_ptr[n + 1];
+        for (int idx = es + lane; idx < ee; idx += 32) {
+            int c = (int)esc_col[idx];
+            float wv = bf16_to_f(esc_val[idx]);
+            acc = fmaf(bf16_to_f(X[c]), wv, acc);
+        }
+        float s = warp_reduce_sum(acc);
+        if (lane == 0) {
+            if (add_res) s += bf16_to_f(Y[n]);
+            Y[n] = f_to_bf16(s);
+        }
+    }
+}
+
+// 19.1b 4-Warps-Per-Row BF12 GEMV for M=1 Long-K N=2560 (mlp_down [2560x9216], 637 GB/s, 0 spill!)
+// Grid: ((N + 1) / 2, 1, 1) [1280 blocks for N=2560], Block: (256, 1, 1) [2 rows/blk x 4 warps/row]
+extern "C" __global__ void skinny_bf12_4wpr_m1_bf16(
+    const bf16_t* __restrict__ X,
+    const unsigned char* __restrict__ W_sm8,
+    const unsigned char* __restrict__ W_exp4,
+    const int* __restrict__ esc_row_ptr,
+    const unsigned short* __restrict__ esc_col,
+    const bf16_t* __restrict__ esc_val,
+    bf16_t* __restrict__ Y,
+    int N,
+    int K,
+    unsigned int e_base,
+    int add_res
+) {
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lane = tid & 31;
+    int r_loc = wid >> 2; // 0 or 1
+    int w_k = wid & 3;    // 0..3
+    int n_base = blockIdx.x * 2;
+    int n = n_base + r_loc;
+    float acc = 0.0f;
+
+    if (n < N) {
+        const uint4* sm_row = reinterpret_cast<const uint4*>(W_sm8 + (size_t)n * K);
+        const uint2* ex_row = reinterpret_cast<const uint2*>(W_exp4 + (size_t)n * (K >> 1));
+        const uint2* x_u2 = reinterpret_cast<const uint2*>(X);
+        int k16 = K >> 4;
+        for (int kv = w_k * 32 + lane; kv < k16; kv += 128) {
+            uint4 sm16 = r13_ldcs_uint4(&sm_row[kv]);
+            uint2 ex16 = r14_ldcs_uint2(&ex_row[kv]);
+            float wf[4];
+            r14_decode_bf12_4f(sm16.x, ex16.x & 0xFFFFu, e_base, wf);
+            {
+                uint2 x2 = __ldg(&x_u2[kv * 4 + 0]);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.x & 0xFFFFu)), wf[0], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.x >> 16)),     wf[1], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.y & 0xFFFFu)), wf[2], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.y >> 16)),     wf[3], acc);
+            }
+            r14_decode_bf12_4f(sm16.y, ex16.x >> 16, e_base, wf);
+            {
+                uint2 x2 = __ldg(&x_u2[kv * 4 + 1]);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.x & 0xFFFFu)), wf[0], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.x >> 16)),     wf[1], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.y & 0xFFFFu)), wf[2], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.y >> 16)),     wf[3], acc);
+            }
+            r14_decode_bf12_4f(sm16.z, ex16.y & 0xFFFFu, e_base, wf);
+            {
+                uint2 x2 = __ldg(&x_u2[kv * 4 + 2]);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.x & 0xFFFFu)), wf[0], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.x >> 16)),     wf[1], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.y & 0xFFFFu)), wf[2], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.y >> 16)),     wf[3], acc);
+            }
+            r14_decode_bf12_4f(sm16.w, ex16.y >> 16, e_base, wf);
+            {
+                uint2 x2 = __ldg(&x_u2[kv * 4 + 3]);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.x & 0xFFFFu)), wf[0], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.x >> 16)),     wf[1], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.y & 0xFFFFu)), wf[2], acc);
+                acc = fmaf(bf16_to_f((bf16_t)(x2.y >> 16)),     wf[3], acc);
+            }
+        }
+        if (w_k == 0) {
+            int es = esc_row_ptr[n];
+            int ee = esc_row_ptr[n + 1];
+            for (int idx = es + lane; idx < ee; idx += 32) {
+                int c = (int)esc_col[idx];
+                acc = fmaf(bf16_to_f(X[c]), bf16_to_f(esc_val[idx]), acc);
+            }
+        }
+    }
+    __shared__ float sm[2][4];
+    float s = warp_reduce_sum(acc);
+    if (lane == 0) sm[r_loc][w_k] = s;
+    __syncthreads();
+    if (tid < 2 && n_base + tid < N) {
+        float sum = sm[tid][0] + sm[tid][1] + sm[tid][2] + sm[tid][3];
+        if (add_res) sum += bf16_to_f(Y[n_base + tid]);
+        Y[n_base + tid] = f_to_bf16(sum);
+    }
+}
+
+// 19.2 Zero-__syncthreads() Pipelined BF12 -> PTX MMA m16n8k16 (SPLIT_K = 4, M = 4..8, 0 spill!)
+// Grid: (N / 16, 1, 1), Block: (128, 1, 1) — 4 warps share 16 rows across K (exact 256B sm8 + 128B exp4 L2 lines!)
+template<int M_VAL>
+__device__ __forceinline__ void bf12_mma_sk4_impl(
+    const bf16_t* __restrict__ X,
+    const unsigned char* __restrict__ W_sm8,
+    const unsigned char* __restrict__ W_exp4,
+    const int* __restrict__ esc_row_ptr,
+    const unsigned short* __restrict__ esc_col,
+    const bf16_t* __restrict__ esc_val,
+    bf16_t* __restrict__ Y,
+    int N,
+    int K,
+    unsigned int e_base,
+    int add_res
+) {
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lane = tid & 31;
+    int n_warp = blockIdx.x * 16;
+    if (n_warp >= N) return;
+
+    __shared__ __align__(16) bf16_t smW[4][16][64]; // 8 KB total
+    __shared__ float smR[4][16][8];                 // 2 KB total (10 KB -> 6+ blocks/SM!)
+
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+    int g = lane >> 2;
+    int t = lane & 3;
+    int a_r = lane & 15;
+    int a_c8 = lane >> 4;
+
+    const unsigned char* sm_p0 = W_sm8 + (size_t)(n_warp + g) * K;
+    const unsigned char* sm_p1 = W_sm8 + (size_t)(n_warp + g + 8) * K;
+    const unsigned char* ex_p0 = W_exp4 + (size_t)(n_warp + g) * (K >> 1);
+    const unsigned char* ex_p1 = W_exp4 + (size_t)(n_warp + g + 8) * (K >> 1);
+    const unsigned int* x_row_u32 = (g < M_VAL) ? reinterpret_cast<const unsigned int*>(X + (size_t)g * K) : nullptr;
+
+    int k_start = 64 * wid;
+    uint4 sm0 = {0, 0, 0, 0}, sm1 = {0, 0, 0, 0};
+    uint2 ex0 = {0, 0}, ex1 = {0, 0};
+    if (k_start < K) {
+        sm0 = r13_ldcs_uint4(reinterpret_cast<const uint4*>(sm_p0 + k_start) + t);
+        ex0 = r14_ldcs_uint2(reinterpret_cast<const uint2*>(ex_p0 + (k_start >> 1)) + t);
+        sm1 = r13_ldcs_uint4(reinterpret_cast<const uint4*>(sm_p1 + k_start) + t);
+        ex1 = r14_ldcs_uint2(reinterpret_cast<const uint2*>(ex_p1 + (k_start >> 1)) + t);
+    }
+
+    for (int k0 = k_start; k0 < K; k0 += 256) {
+        uint4 n_sm0, n_sm1;
+        uint2 n_ex0, n_ex1;
+        int k_next = k0 + 256;
+        if (k_next < K) {
+            n_sm0 = r13_ldcs_uint4(reinterpret_cast<const uint4*>(sm_p0 + k_next) + t);
+            n_ex0 = r14_ldcs_uint2(reinterpret_cast<const uint2*>(ex_p0 + (k_next >> 1)) + t);
+            n_sm1 = r13_ldcs_uint4(reinterpret_cast<const uint4*>(sm_p1 + k_next) + t);
+            n_ex1 = r14_ldcs_uint2(reinterpret_cast<const uint2*>(ex_p1 + (k_next >> 1)) + t);
+        }
+
+        uint2 p0 = r14_decode_bf12_4u(sm0.x, ex0.x & 0xFFFFu, e_base);
+        uint2 p1 = r14_decode_bf12_4u(sm0.y, ex0.x >> 16,     e_base);
+        uint2 p2 = r14_decode_bf12_4u(sm0.z, ex0.y & 0xFFFFu, e_base);
+        uint2 p3 = r14_decode_bf12_4u(sm0.w, ex0.y >> 16,     e_base);
+        *reinterpret_cast<uint4*>(&smW[wid][g][r15_swz64_bf16(g, t * 2)])     = {p0.x, p0.y, p1.x, p1.y};
+        *reinterpret_cast<uint4*>(&smW[wid][g][r15_swz64_bf16(g, t * 2 + 1)]) = {p2.x, p2.y, p3.x, p3.y};
+
+        uint2 q0 = r14_decode_bf12_4u(sm1.x, ex1.x & 0xFFFFu, e_base);
+        uint2 q1 = r14_decode_bf12_4u(sm1.y, ex1.x >> 16,     e_base);
+        uint2 q2 = r14_decode_bf12_4u(sm1.z, ex1.y & 0xFFFFu, e_base);
+        uint2 q3 = r14_decode_bf12_4u(sm1.w, ex1.y >> 16,     e_base);
+        *reinterpret_cast<uint4*>(&smW[wid][g + 8][r15_swz64_bf16(g + 8, t * 2)])     = {q0.x, q0.y, q1.x, q1.y};
+        *reinterpret_cast<uint4*>(&smW[wid][g + 8][r15_swz64_bf16(g + 8, t * 2 + 1)]) = {q2.x, q2.y, q3.x, q3.y};
+        __syncwarp();
+
+        #pragma unroll
+        for (int ks = 0; ks < 4; ++ks) {
+            unsigned int a0, a1, a2, a3;
+            r15_ldmatrix_x4(a0, a1, a2, a3, &smW[wid][a_r][r15_swz64_bf16(a_r, ks * 2 + a_c8)]);
+            unsigned int b0 = 0u, b1 = 0u;
+            if (g < M_VAL) {
+                int x_u32_base = (k0 + ks * 16) >> 1;
+                b0 = __ldg(&x_row_u32[x_u32_base + t]);
+                b1 = __ldg(&x_row_u32[x_u32_base + t + 4]);
+            }
+            r15_mma_m16n8k16_bf16(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, d0, d1, d2, d3);
+        }
+
+        sm0 = n_sm0; ex0 = n_ex0; sm1 = n_sm1; ex1 = n_ex1;
+    }
+
+    int m0 = t * 2;
+    int m1 = m0 + 1;
+    if (m0 < M_VAL) {
+        smR[wid][g][m0] = d0;
+        smR[wid][g + 8][m0] = d2;
+        if (m1 < M_VAL) {
+            smR[wid][g][m1] = d1;
+            smR[wid][g + 8][m1] = d3;
+        }
+    }
+    __syncthreads();
+
+    // Warp-parallel reduction + 32-lane parallel CSR escape patch (4 rows/warp -> 0 serial tail stalls!)
+    #pragma unroll
+    for (int rr = 0; rr < 4; ++rr) {
+        int loc_r = wid * 4 + rr;
+        int r = n_warp + loc_r;
+        int es = esc_row_ptr[r];
+        int ee = esc_row_ptr[r + 1];
+        float eacc[M_VAL];
+        #pragma unroll
+        for (int m = 0; m < M_VAL; ++m) eacc[m] = 0.0f;
+        if (es < ee) {
+            for (int idx = es + lane; idx < ee; idx += 32) {
+                int c = (int)esc_col[idx];
+                float wv = bf16_to_f(esc_val[idx]);
+                #pragma unroll
+                for (int m = 0; m < M_VAL; ++m) {
+                    eacc[m] = fmaf(bf16_to_f(X[(size_t)m * K + c]), wv, eacc[m]);
+                }
+            }
+            #pragma unroll
+            for (int m = 0; m < M_VAL; ++m) eacc[m] = warp_reduce_sum(eacc[m]);
+        }
+        if (lane == 0) {
+            #pragma unroll
+            for (int m = 0; m < M_VAL; ++m) {
+                float s = smR[0][loc_r][m] + smR[1][loc_r][m] + smR[2][loc_r][m] + smR[3][loc_r][m] + eacc[m];
+                if (add_res) s += bf16_to_f(Y[(size_t)m * N + r]);
+                Y[(size_t)m * N + r] = f_to_bf16(s);
+            }
+        }
+    }
+}
+
+extern "C" __global__ void bf12_mma_sk4_m4_bf16(
+    const bf16_t* __restrict__ X, const unsigned char* __restrict__ sm8, const unsigned char* __restrict__ exp4,
+    const int* __restrict__ rp, const unsigned short* __restrict__ ec, const bf16_t* __restrict__ ev,
+    bf16_t* __restrict__ Y, int N, int K, unsigned int e_base, int add_res
+) { bf12_mma_sk4_impl<4>(X, sm8, exp4, rp, ec, ev, Y, N, K, e_base, add_res); }
+
+extern "C" __global__ void bf12_mma_sk4_m5_bf16(
+    const bf16_t* __restrict__ X, const unsigned char* __restrict__ sm8, const unsigned char* __restrict__ exp4,
+    const int* __restrict__ rp, const unsigned short* __restrict__ ec, const bf16_t* __restrict__ ev,
+    bf16_t* __restrict__ Y, int N, int K, unsigned int e_base, int add_res
+) { bf12_mma_sk4_impl<5>(X, sm8, exp4, rp, ec, ev, Y, N, K, e_base, add_res); }
+
+extern "C" __global__ void bf12_mma_sk4_m6_bf16(
+    const bf16_t* __restrict__ X, const unsigned char* __restrict__ sm8, const unsigned char* __restrict__ exp4,
+    const int* __restrict__ rp, const unsigned short* __restrict__ ec, const bf16_t* __restrict__ ev,
+    bf16_t* __restrict__ Y, int N, int K, unsigned int e_base, int add_res
+) { bf12_mma_sk4_impl<6>(X, sm8, exp4, rp, ec, ev, Y, N, K, e_base, add_res); }
+
+extern "C" __global__ void bf12_mma_sk4_m7_bf16(
+    const bf16_t* __restrict__ X, const unsigned char* __restrict__ sm8, const unsigned char* __restrict__ exp4,
+    const int* __restrict__ rp, const unsigned short* __restrict__ ec, const bf16_t* __restrict__ ev,
+    bf16_t* __restrict__ Y, int N, int K, unsigned int e_base, int add_res
+) { bf12_mma_sk4_impl<7>(X, sm8, exp4, rp, ec, ev, Y, N, K, e_base, add_res); }
+
+extern "C" __global__ void bf12_mma_sk4_m8_bf16(
+    const bf16_t* __restrict__ X, const unsigned char* __restrict__ sm8, const unsigned char* __restrict__ exp4,
+    const int* __restrict__ rp, const unsigned short* __restrict__ ec, const bf16_t* __restrict__ ev,
+    bf16_t* __restrict__ Y, int N, int K, unsigned int e_base, int add_res
+) { bf12_mma_sk4_impl<8>(X, sm8, exp4, rp, ec, ev, Y, N, K, e_base, add_res); }
+
+// 19.3 Zero-__syncthreads() Pipelined BF12 -> PTX MMA lm_head + Online Argmax (M = 4..8, SK = 4, 0 spill!)
+// Grid: (1024, 1, 1), Block: (128, 1, 1) -> followed by argmax_batch_stage2_bf16(num_blocks=1024)
+template<int M_VAL>
+__device__ __forceinline__ void lm_head_bf12_mma_argmax_impl(
+    const bf16_t* __restrict__ X,
+    const unsigned char* __restrict__ W_sm8,
+    const unsigned char* __restrict__ W_exp4,
+    const int* __restrict__ esc_row_ptr,
+    const unsigned short* __restrict__ esc_col,
+    const bf16_t* __restrict__ esc_val,
+    float* __restrict__ part_vals,
+    int* __restrict__ part_idxs,
+    int V,
+    unsigned int e_base
+) {
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lane = tid & 31;
+    int g = lane >> 2;
+    int t = lane & 3;
+    int a_r = lane & 15;
+    int a_c8 = lane >> 4;
+    const unsigned int* x_row_u32 = (g < M_VAL) ? reinterpret_cast<const unsigned int*>(X + (size_t)g * 2560) : nullptr;
+
+    __shared__ __align__(16) bf16_t smW[4][16][64];
+    __shared__ float smR[4][16][8];
+
+    int total_t16 = V >> 4;
+    int t0 = (blockIdx.x * total_t16) / gridDim.x;
+    int t1 = ((blockIdx.x + 1) * total_t16) / gridDim.x;
+
+    float bv0 = -1e30f, bv1 = -1e30f;
+    int bi0 = 0, bi1 = 0;
+    int m0 = t * 2;
+    int m1 = m0 + 1;
+
+    for (int tile = t0; tile < t1; ++tile) {
+        int n_warp = tile * 16;
+        float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+        const unsigned char* sm_p0 = W_sm8 + (size_t)(n_warp + g) * 2560;
+        const unsigned char* sm_p1 = W_sm8 + (size_t)(n_warp + g + 8) * 2560;
+        const unsigned char* ex_p0 = W_exp4 + (size_t)(n_warp + g) * 1280;
+        const unsigned char* ex_p1 = W_exp4 + (size_t)(n_warp + g + 8) * 1280;
+
+        int k_start = wid * 64;
+        uint4 sm0 = r13_ldcs_uint4(reinterpret_cast<const uint4*>(sm_p0 + k_start) + t);
+        uint2 ex0 = r14_ldcs_uint2(reinterpret_cast<const uint2*>(ex_p0 + (k_start >> 1)) + t);
+        uint4 sm1 = r13_ldcs_uint4(reinterpret_cast<const uint4*>(sm_p1 + k_start) + t);
+        uint2 ex1 = r14_ldcs_uint2(reinterpret_cast<const uint2*>(ex_p1 + (k_start >> 1)) + t);
+
+        #pragma unroll 2
+        for (int s = 0; s < 10; ++s) {
+            int k0 = s * 256 + k_start;
+            uint4 n_sm0, n_sm1;
+            uint2 n_ex0, n_ex1;
+            if (s + 1 < 10) {
+                int kn = k0 + 256;
+                n_sm0 = r13_ldcs_uint4(reinterpret_cast<const uint4*>(sm_p0 + kn) + t);
+                n_ex0 = r14_ldcs_uint2(reinterpret_cast<const uint2*>(ex_p0 + (kn >> 1)) + t);
+                n_sm1 = r13_ldcs_uint4(reinterpret_cast<const uint4*>(sm_p1 + kn) + t);
+                n_ex1 = r14_ldcs_uint2(reinterpret_cast<const uint2*>(ex_p1 + (kn >> 1)) + t);
+            }
+            uint2 p0 = r14_decode_bf12_4u(sm0.x, ex0.x & 0xFFFFu, e_base);
+            uint2 p1 = r14_decode_bf12_4u(sm0.y, ex0.x >> 16,     e_base);
+            uint2 p2 = r14_decode_bf12_4u(sm0.z, ex0.y & 0xFFFFu, e_base);
+            uint2 p3 = r14_decode_bf12_4u(sm0.w, ex0.y >> 16,     e_base);
+            *reinterpret_cast<uint4*>(&smW[wid][g][r15_swz64_bf16(g, t * 2)])     = {p0.x, p0.y, p1.x, p1.y};
+            *reinterpret_cast<uint4*>(&smW[wid][g][r15_swz64_bf16(g, t * 2 + 1)]) = {p2.x, p2.y, p3.x, p3.y};
+
+            uint2 q0 = r14_decode_bf12_4u(sm1.x, ex1.x & 0xFFFFu, e_base);
+            uint2 q1 = r14_decode_bf12_4u(sm1.y, ex1.x >> 16,     e_base);
+            uint2 q2 = r14_decode_bf12_4u(sm1.z, ex1.y & 0xFFFFu, e_base);
+            uint2 q3 = r14_decode_bf12_4u(sm1.w, ex1.y >> 16,     e_base);
+            *reinterpret_cast<uint4*>(&smW[wid][g + 8][r15_swz64_bf16(g + 8, t * 2)])     = {q0.x, q0.y, q1.x, q1.y};
+            *reinterpret_cast<uint4*>(&smW[wid][g + 8][r15_swz64_bf16(g + 8, t * 2 + 1)]) = {q2.x, q2.y, q3.x, q3.y};
+            __syncwarp();
+
+            #pragma unroll
+            for (int ks = 0; ks < 4; ++ks) {
+                unsigned int a0, a1, a2, a3;
+                r15_ldmatrix_x4(a0, a1, a2, a3, &smW[wid][a_r][r15_swz64_bf16(a_r, ks * 2 + a_c8)]);
+                unsigned int b0 = 0u, b1 = 0u;
+                if (g < M_VAL) {
+                    int xb = (k0 + ks * 16) >> 1;
+                    b0 = __ldg(&x_row_u32[xb + t]);
+                    b1 = __ldg(&x_row_u32[xb + t + 4]);
+                }
+                r15_mma_m16n8k16_bf16(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, d0, d1, d2, d3);
+            }
+            sm0 = n_sm0; ex0 = n_ex0; sm1 = n_sm1; ex1 = n_ex1;
+        }
+
+        if (m0 < M_VAL) {
+            smR[wid][g][m0] = d0;
+            smR[wid][g + 8][m0] = d2;
+            if (m1 < M_VAL) {
+                smR[wid][g][m1] = d1;
+                smR[wid][g + 8][m1] = d3;
+            }
+        }
+        __syncthreads();
+        if (wid == 0 && m0 < M_VAL) {
+            float s0 = smR[0][g][m0] + smR[1][g][m0] + smR[2][g][m0] + smR[3][g][m0];
+            float s2 = smR[0][g + 8][m0] + smR[1][g + 8][m0] + smR[2][g + 8][m0] + smR[3][g + 8][m0];
+            float s1 = (m1 < M_VAL) ? (smR[0][g][m1] + smR[1][g][m1] + smR[2][g][m1] + smR[3][g][m1]) : 0.0f;
+            float s3 = (m1 < M_VAL) ? (smR[0][g + 8][m1] + smR[1][g + 8][m1] + smR[2][g + 8][m1] + smR[3][g + 8][m1]) : 0.0f;
+            int r0 = n_warp + g;
+            int r1 = r0 + 8;
+            int es0 = esc_row_ptr[r0];
+            int ee0 = esc_row_ptr[r0 + 1];
+            for (int idx = es0; idx < ee0; ++idx) {
+                int c = (int)esc_col[idx];
+                float wv = bf16_to_f(esc_val[idx]);
+                s0 = fmaf(bf16_to_f(X[(size_t)m0 * 2560 + c]), wv, s0);
+                if (m1 < M_VAL) s1 = fmaf(bf16_to_f(X[(size_t)m1 * 2560 + c]), wv, s1);
+            }
+            int es1 = esc_row_ptr[r1];
+            int ee1 = esc_row_ptr[r1 + 1];
+            for (int idx = es1; idx < ee1; ++idx) {
+                int c = (int)esc_col[idx];
+                float wv = bf16_to_f(esc_val[idx]);
+                s2 = fmaf(bf16_to_f(X[(size_t)m0 * 2560 + c]), wv, s2);
+                if (m1 < M_VAL) s3 = fmaf(bf16_to_f(X[(size_t)m1 * 2560 + c]), wv, s3);
+            }
+            if (s0 > bv0) { bv0 = s0; bi0 = r0; }
+            if (s2 > bv0) { bv0 = s2; bi0 = r1; }
+            if (m1 < M_VAL) {
+                if (s1 > bv1) { bv1 = s1; bi1 = r0; }
+                if (s3 > bv1) { bv1 = s3; bi1 = r1; }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (wid == 0) {
+        #pragma unroll
+        for (int off = 16; off >= 4; off >>= 1) {
+            float ov0 = __shfl_down_sync(0xffffffff, bv0, off);
+            int   oi0 = __shfl_down_sync(0xffffffff, bi0, off);
+            if (ov0 > bv0) { bv0 = ov0; bi0 = oi0; }
+            float ov1 = __shfl_down_sync(0xffffffff, bv1, off);
+            int   oi1 = __shfl_down_sync(0xffffffff, bi1, off);
+            if (ov1 > bv1) { bv1 = ov1; bi1 = oi1; }
+        }
+        if (g == 0) {
+            if (m0 < M_VAL) { part_vals[m0 * gridDim.x + blockIdx.x] = bv0; part_idxs[m0 * gridDim.x + blockIdx.x] = bi0; }
+            if (m1 < M_VAL) { part_vals[m1 * gridDim.x + blockIdx.x] = bv1; part_idxs[m1 * gridDim.x + blockIdx.x] = bi1; }
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(128, 4) void lm_head_bf12_mma_argmax_m4_bf16(
+    const bf16_t* __restrict__ X, const unsigned char* __restrict__ sm8, const unsigned char* __restrict__ exp4,
+    const int* __restrict__ rp, const unsigned short* __restrict__ ec, const bf16_t* __restrict__ ev,
+    float* __restrict__ pv, int* __restrict__ pi, int V, unsigned int e_base
+) { lm_head_bf12_mma_argmax_impl<4>(X, sm8, exp4, rp, ec, ev, pv, pi, V, e_base); }
+
+extern "C" __global__ __launch_bounds__(128, 4) void lm_head_bf12_mma_argmax_m5_bf16(
+    const bf16_t* __restrict__ X, const unsigned char* __restrict__ sm8, const unsigned char* __restrict__ exp4,
+    const int* __restrict__ rp, const unsigned short* __restrict__ ec, const bf16_t* __restrict__ ev,
+    float* __restrict__ pv, int* __restrict__ pi, int V, unsigned int e_base
+) { lm_head_bf12_mma_argmax_impl<5>(X, sm8, exp4, rp, ec, ev, pv, pi, V, e_base); }
+
+extern "C" __global__ __launch_bounds__(128, 4) void lm_head_bf12_mma_argmax_m6_bf16(
+    const bf16_t* __restrict__ X, const unsigned char* __restrict__ sm8, const unsigned char* __restrict__ exp4,
+    const int* __restrict__ rp, const unsigned short* __restrict__ ec, const bf16_t* __restrict__ ev,
+    float* __restrict__ pv, int* __restrict__ pi, int V, unsigned int e_base
+) { lm_head_bf12_mma_argmax_impl<6>(X, sm8, exp4, rp, ec, ev, pv, pi, V, e_base); }
+
+extern "C" __global__ __launch_bounds__(128, 4) void lm_head_bf12_mma_argmax_m7_bf16(
+    const bf16_t* __restrict__ X, const unsigned char* __restrict__ sm8, const unsigned char* __restrict__ exp4,
+    const int* __restrict__ rp, const unsigned short* __restrict__ ec, const bf16_t* __restrict__ ev,
+    float* __restrict__ pv, int* __restrict__ pi, int V, unsigned int e_base
+) { lm_head_bf12_mma_argmax_impl<7>(X, sm8, exp4, rp, ec, ev, pv, pi, V, e_base); }
+
+extern "C" __global__ __launch_bounds__(128, 4) void lm_head_bf12_mma_argmax_m8_bf16(
+    const bf16_t* __restrict__ X, const unsigned char* __restrict__ sm8, const unsigned char* __restrict__ exp4,
+    const int* __restrict__ rp, const unsigned short* __restrict__ ec, const bf16_t* __restrict__ ev,
+    float* __restrict__ pv, int* __restrict__ pi, int V, unsigned int e_base
+) { lm_head_bf12_mma_argmax_impl<8>(X, sm8, exp4, rp, ec, ev, pv, pi, V, e_base); }
+
+// ============================================================================
+// 19.4 PHASE R15 (H2): CONFIDENCE-GATED ADAPTIVE MTP (ZERO-OVERHEAD TOP1-TOP2
+//      MARGIN + CUDA 12.8 GRAPH CONDITIONAL IF EARLY-EXIT, 100% BIT-EXACT!)
+// ============================================================================
+
+// Fused BF12 lm_head + Online Top-1 & Top-2 Argmax (M = 1, +1 float reg, 0.00 ms overhead, 0 spill!)
+// Grid: (1024, 1, 1), Block: (256, 1, 1) -> followed by argmax_stage2_conf_bf16(num_blocks=1024)
+extern "C" __global__ void lm_head_bf12_argmax_m1_conf_bf16(
+    const bf16_t* __restrict__ X,
+    const unsigned char* __restrict__ W_sm8,
+    const unsigned char* __restrict__ W_exp4,
+    const int* __restrict__ esc_row_ptr,
+    const unsigned short* __restrict__ esc_col,
+    const bf16_t* __restrict__ esc_val,
+    float* __restrict__ part_vals,
+    int* __restrict__ part_idxs,
+    float* __restrict__ part_v2,
+    int V,
+    unsigned int e_base
+) {
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
+    int lane = tid & 31;
+    int rpb = (V + gridDim.x - 1) / gridDim.x;
+    int v0 = blockIdx.x * rpb;
+    int v1 = min(v0 + rpb, V);
+
+    float bv = -1e30f;
+    float bv2 = -1e30f;
+    int bi = 0;
+
+    const uint4* xr = reinterpret_cast<const uint4*>(X);
+    for (int n = v0 + wid; n < v1; n += 8) {
+        const uint4* sm_row = reinterpret_cast<const uint4*>(W_sm8 + (size_t)n * 2560);
+        const uint2* ex_row = reinterpret_cast<const uint2*>(W_exp4 + (size_t)n * 1280);
+        float acc = 0.0f;
+
+        #pragma unroll
+        for (int s = 0; s < 5; ++s) {
+            int kv = s * 32 + lane;
+            uint4 sm16 = r13_ldcs_uint4(&sm_row[kv]);
+            uint2 ex16 = r14_ldcs_uint2(&ex_row[kv]);
+            float wf0[4], wf1[4], wf2[4], wf3[4];
+            r14_decode_bf12_4f(sm16.x, ex16.x & 0xFFFFu, e_base, wf0);
+            r14_decode_bf12_4f(sm16.y, ex16.x >> 16,     e_base, wf1);
+            r14_decode_bf12_4f(sm16.z, ex16.y & 0xFFFFu, e_base, wf2);
+            r14_decode_bf12_4f(sm16.w, ex16.y >> 16,     e_base, wf3);
+            uint4 x0 = __ldg(&xr[kv * 2]);
+            uint4 x1 = __ldg(&xr[kv * 2 + 1]);
+            float xf0[8], xf1[8];
+            unpack_uint4_bf16(x0, xf0);
+            unpack_uint4_bf16(x1, xf1);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                acc = fmaf(xf0[j],     wf0[j], acc);
+                acc = fmaf(xf0[j + 4], wf1[j], acc);
+                acc = fmaf(xf1[j],     wf2[j], acc);
+                acc = fmaf(xf1[j + 4], wf3[j], acc);
+            }
+        }
+        int es = esc_row_ptr[n];
+        int ee = esc_row_ptr[n + 1];
+        for (int idx = es + lane; idx < ee; idx += 32) {
+            int c = (int)esc_col[idx];
+            acc = fmaf(bf16_to_f(X[c]), bf16_to_f(esc_val[idx]), acc);
+        }
+        float d = warp_reduce_sum(acc);
+        if (lane == 0) {
+            if (d > bv) {
+                bv2 = bv;
+                bv = d;
+                bi = n;
+            } else if (d > bv2) {
+                bv2 = d;
+            }
+        }
+    }
+
+    __shared__ float sm_v[8];
+    __shared__ float sm_v2[8];
+    __shared__ int sm_i[8];
+    if (lane == 0) {
+        sm_v[wid] = bv;
+        sm_v2[wid] = bv2;
+        sm_i[wid] = bi;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float bestv = sm_v[0];
+        float bestv2 = sm_v2[0];
+        int besti = sm_i[0];
+        #pragma unroll
+        for (int w = 1; w < 8; ++w) {
+            float v1w = sm_v[w];
+            float v2w = sm_v2[w];
+            if (v1w > bestv) {
+                bestv2 = fmaxf(bestv, v2w);
+                bestv = v1w;
+                besti = sm_i[w];
+            } else if (v1w > bestv2) {
+                bestv2 = v1w;
+            }
+        }
+        part_vals[blockIdx.x] = bestv;
+        part_idxs[blockIdx.x] = besti;
+        part_v2[blockIdx.x] = bestv2;
+    }
+}
+
+// Stage-2 Top-1/Top-2 Margin Reduction + CUDA 12.8 Conditional Handle Trigger (Grid: 1, Block: 256)
+extern "C" __global__ void argmax_stage2_conf_bf16(
+    const float* __restrict__ part_vals,
+    const int* __restrict__ part_idxs,
+    const float* __restrict__ part_v2,
+    long long* __restrict__ out_id,
+    float* __restrict__ out_margin,
+    int* __restrict__ active_drafts_out,
+    int num_blocks,
+    int set_active_val,
+    float thresh,
+    unsigned long long cond_handle
+) {
+    int tid = threadIdx.x;
+    float lv1 = -1e30f;
+    float lv2 = -1e30f;
+    int li1 = 0;
+    for (int i = tid; i < num_blocks; i += 256) {
+        float v1 = part_vals[i];
+        float v2 = part_v2[i];
+        if (v1 > lv1) {
+            lv2 = fmaxf(lv1, v2);
+            lv1 = v1;
+            li1 = part_idxs[i];
+        } else if (v1 > lv2) {
+            lv2 = v1;
+        }
+    }
+    __shared__ float s_v1[256];
+    __shared__ float s_v2[256];
+    __shared__ int s_i1[256];
+    s_v1[tid] = lv1;
+    s_v2[tid] = lv2;
+    s_i1[tid] = li1;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            float ov1 = s_v1[tid + stride];
+            float ov2 = s_v2[tid + stride];
+            if (ov1 > s_v1[tid]) {
+                s_v2[tid] = fmaxf(s_v1[tid], ov2);
+                s_v1[tid] = ov1;
+                s_i1[tid] = s_i1[tid + stride];
+            } else if (ov1 > s_v2[tid]) {
+                s_v2[tid] = ov1;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out_id[0] = (long long)s_i1[0];
+        float margin = s_v1[0] - s_v2[0];
+        if (out_margin != nullptr) out_margin[0] = margin;
+        if (active_drafts_out != nullptr && set_active_val > 0) active_drafts_out[0] = set_active_val;
+        if (cond_handle != 0ULL) {
+            cudaGraphSetConditional((cudaGraphConditionalHandle)cond_handle, (margin >= thresh) ? 1u : 0u);
+        }
+    }
+}
+
+// Prefix Conditional Evaluator for d2 inside draft_and_verify_graph (Grid: 1, Block: 1)
+extern "C" __global__ void eval_mtp_cond_d2_bf16(
+    const float* __restrict__ d1_margin,
+    int* __restrict__ active_drafts_out,
+    int init_active_val,
+    float thresh,
+    unsigned long long cond_handle
+) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        active_drafts_out[0] = init_active_val;
+        if (cond_handle != 0ULL) {
+            cudaGraphSetConditional((cudaGraphConditionalHandle)cond_handle, (d1_margin[0] >= thresh) ? 1u : 0u);
+        }
+    }
+}
+
+
 
 
 
