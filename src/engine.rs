@@ -2779,8 +2779,11 @@ impl RustSplitEngine {
 
     fn draft_and_verify_body(&self, mtp: &MtpRuntime) -> Result<()> {
         // Assumes v_tok_ids[0] = cur_tok, mtp.mtp_pos = cur_pos, mtp.v_pos = cur_pos, mtp.mtp_out_tok = d1!
+        let track_conf = mtp.conf_thresh > 0.0 || mtp.log_cal;
         self.cuda.dtod_async(mtp.v_tok_ids + 8, mtp.mtp_out_tok, 8)?;
-        self.launch_eval_mtp_cond_d2(mtp, mtp.draft_k as i32, 0.0, 0)?;
+        if track_conf {
+            self.launch_eval_mtp_cond_d2(mtp, mtp.draft_k as i32, 0.0, 0)?;
+        }
         let mut mpos_p = mtp.mtp_pos;
         for idx in 1..mtp.draft_k {
             self.cuda.dtod_async(mtp.v_hidden, mtp.mtp_h_norm, 2560 * 2)?;
@@ -2795,8 +2798,10 @@ impl RustSplitEngine {
                 )?;
             }
         }
-        self.cuda.dtoh_async(mtp.h_active_drafts as *mut u8, mtp.d_active_drafts, 4)?;
-        self.cuda.dtoh_async(mtp.h_margins as *mut u8, mtp.d_d1_margin, mtp.draft_k * 4)?;
+        if track_conf {
+            self.cuda.dtoh_async(mtp.h_active_drafts as *mut u8, mtp.d_active_drafts, 4)?;
+            self.cuda.dtoh_async(mtp.h_margins as *mut u8, mtp.d_d1_margin, mtp.draft_k * 4)?;
+        }
         self.cuda.dtoh_async(mtp.h_draft_toks as *mut u8, mtp.v_tok_ids + 8, mtp.draft_k * 8)?;
         self.verify_body(mtp)?;
         self.cuda.dtoh_async(mtp.h_verify_toks as *mut u8, mtp.v_out_toks, mtp.verify_m * 8)?;
@@ -3139,21 +3144,25 @@ impl RustSplitEngine {
                 &mut eps as *mut _ as *mut c_void,
             ],
         )?;
-        launch_lm_head_bf12_argmax_m1_conf(
-            &self.cuda,
-            &self.funcs.bf12,
-            mtp.mtp_h_norm,
-            self.weights.lm_head_w,
-            mtp.v_arg_vals,
-            mtp.v_arg_idxs,
-            mtp.v_arg_v2,
-            mtp.mtp_out_tok,
-            mtp.d_d1_margin + (margin_slot * 4) as u64,
-            mtp.d_active_drafts,
-            set_active_val,
-            mtp.conf_thresh,
-            cond_handle,
-        )?;
+        if mtp.conf_thresh > 0.0 || mtp.log_cal {
+            launch_lm_head_bf12_argmax_m1_conf(
+                &self.cuda,
+                &self.funcs.bf12,
+                mtp.mtp_h_norm,
+                self.weights.lm_head_w,
+                mtp.v_arg_vals,
+                mtp.v_arg_idxs,
+                mtp.v_arg_v2,
+                mtp.mtp_out_tok,
+                mtp.d_d1_margin + (margin_slot * 4) as u64,
+                mtp.d_active_drafts,
+                set_active_val,
+                mtp.conf_thresh,
+                cond_handle,
+            )?;
+        } else {
+            self.launch_lm_head_argmax(1, mtp.mtp_h_norm, mtp.v_arg_vals, mtp.v_arg_idxs, mtp.mtp_out_tok)?;
+        }
         Ok(())
     }
 
@@ -3402,21 +3411,25 @@ impl RustSplitEngine {
                 &mut eps as *mut _ as *mut c_void,
             ],
         )?;
-        launch_lm_head_bf12_argmax_m1_conf(
-            &self.cuda,
-            &self.funcs.bf12,
-            mtp.mtp_h_norm,
-            self.weights.lm_head_w,
-            mtp.v_arg_vals,
-            mtp.v_arg_idxs,
-            mtp.v_arg_v2,
-            mtp.mtp_out_tok,
-            mtp.d_d1_margin,
-            0,
-            0,
-            mtp.conf_thresh,
-            0,
-        )?;
+        if mtp.conf_thresh > 0.0 || mtp.log_cal {
+            launch_lm_head_bf12_argmax_m1_conf(
+                &self.cuda,
+                &self.funcs.bf12,
+                mtp.mtp_h_norm,
+                self.weights.lm_head_w,
+                mtp.v_arg_vals,
+                mtp.v_arg_idxs,
+                mtp.v_arg_v2,
+                mtp.mtp_out_tok,
+                mtp.d_d1_margin,
+                0,
+                0,
+                mtp.conf_thresh,
+                0,
+            )?;
+        } else {
+            self.launch_lm_head_argmax(1, mtp.mtp_h_norm, mtp.v_arg_vals, mtp.v_arg_idxs, mtp.mtp_out_tok)?;
+        }
         Ok(0)
     }
 

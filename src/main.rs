@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
     let mut max_seq: usize = 2048;
     let mut max_batch: usize = 1;
     let mut mtp_drafts: usize = 3;
-    let mut mtp_conf_thresh: f32 = 0.8;
+    let mut mtp_conf_thresh: f32 = 0.0;
     let mut prefix_cache_slots: usize = 8;
     let mut force_max_seq = false;
     let mut skinny_m4_wide = true;

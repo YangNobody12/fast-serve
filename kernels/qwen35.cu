@@ -5729,7 +5729,7 @@ extern "C" __global__ __launch_bounds__(128, 4) void lm_head_bf12_mma_argmax_m8_
 
 // Fused BF12 lm_head + Online Top-1 & Top-2 Argmax (M = 1, +1 float reg, 0.00 ms overhead, 0 spill!)
 // Grid: (1024, 1, 1), Block: (256, 1, 1) -> followed by argmax_stage2_conf_bf16(num_blocks=1024)
-extern "C" __global__ void lm_head_bf12_argmax_m1_conf_bf16(
+extern "C" __global__ __launch_bounds__(256, 3) void lm_head_bf12_argmax_m1_conf_bf16(
     const bf16_t* __restrict__ X,
     const unsigned char* __restrict__ W_sm8,
     const unsigned char* __restrict__ W_exp4,
@@ -5790,13 +5790,9 @@ extern "C" __global__ void lm_head_bf12_argmax_m1_conf_bf16(
         }
         float d = warp_reduce_sum(acc);
         if (lane == 0) {
-            if (d > bv) {
-                bv2 = bv;
-                bv = d;
-                bi = n;
-            } else if (d > bv2) {
-                bv2 = d;
-            }
+            bool gt = (d > bv);
+            bv2 = gt ? bv : fmaxf(bv2, d);
+            if (gt) { bv = d; bi = n; }
         }
     }
 
