@@ -10,10 +10,11 @@ use std::time::Instant;
 
 use crate::config::TextConfig;
 use crate::cuda_ffi::{CUdeviceptr, CUevent, CUfunction, CUgraphExec, CudaRuntime};
-use crate::loader::{load_split_weights, LoadedSplitWeights, MtpWeights, PackedLayerPtrs};
+use crate::loader::{load_split_weights, Bf12Ptr, LoadedSplitWeights, MtpWeights, PackedLayerPtrs};
 use crate::tokenizer::QwenTokenizer;
 
-pub(crate) const PTX_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qwen35.ptx"));
+pub(crate) const PTX_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qwen35.cubin"));
+pub(crate) const W_UNPACK_BYTES: usize = 18432 * 2560 * 2; // 90.00 MiB shared BF12->BF16 unpack scratch for short prefill / BF16 fallback
 
 struct KernelFuncs {
     rmsnorm_2d: CUfunction,
@@ -31,33 +32,959 @@ struct KernelFuncs {
     prefill_gqa_causal_gated: CUfunction,
     gqa_flash_splitk: CUfunction,
     gqa_flash_reduce: CUfunction,
-    embed_single: CUfunction,
-    embed_prefill: CUfunction,
-    argmax_stage1: CUfunction,
     argmax_stage2: CUfunction,
     inc_pos: CUfunction,
     copy_i64: CUfunction,
     // Phase R3: MTP + Parallel Verify
-    mtp_pre_fc_concat: CUfunction,
     conv1d_verify_m: CUfunction,
     deltanet_verify_m: CUfunction,
     deltanet_commit_partial: CUfunction,
     qk_rope_kv_verify_m: CUfunction,
     gqa_verify_m_splitk: CUfunction,
     gqa_verify_m_reduce: CUfunction,
-    argmax_batch_stage1: CUfunction,
     argmax_batch_stage2: CUfunction,
-    // Phase R6: Custom Warp-Vectorized Skinny BF16 GEMM (M=1..4) + Fused Residual Add
-    skinny_gemm_m1: CUfunction,
-    skinny_gemm_m2: CUfunction,
-    skinny_gemm_m3: CUfunction,
-    skinny_gemm_m4: CUfunction,
     // Phase R8: Chunked WY-Form Gated DeltaNet Prefill (Ampere Tensor Cores)
     wy: WyKernelFuncs,
     // Phase R9: 2D Parallel Conv1D Prefill + WMMA BF16 Tensor Core FlashAttention-2
     conv1d_prefill_2d: CUfunction,
     conv1d_update_state: CUfunction,
-    prefill_gqa_wmma: CUfunction,
+    // Phase R10 + R11 + R12: Online SmoothQuant + Ozaki + Custom PTX IMMA + 32x16 RegO FA2
+    r10: Int8PrefillFuncs,
+    prefill_gqa_wmma_32x16: CUfunction,
+    // Phase R14: Lossless BF12 Decode + Embed + Batched Fused lm_head_argmax (M=1..5)
+    bf12: Bf12DecodeFuncs,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Bf12DecodeFuncs {
+    pub embed_single: CUfunction,
+    pub embed_prefill: CUfunction,
+    pub mtp_pre_fc_concat: CUfunction,
+    pub skinny: [CUfunction; 5],
+    pub lm_head: [CUfunction; 5],
+}
+
+impl Bf12DecodeFuncs {
+    pub fn load(cuda: &CudaRuntime) -> Result<Self> {
+        Ok(Self {
+            embed_single: cuda.get_func("embed_lookup_single_bf12")?,
+            embed_prefill: cuda.get_func("embed_lookup_prefill_bf12")?,
+            mtp_pre_fc_concat: cuda.get_func("mtp_pre_fc_concat_bf12")?,
+            skinny: [
+                cuda.get_func("skinny_bf12_m1_bf16")?,
+                cuda.get_func("skinny_bf12_m2_bf16")?,
+                cuda.get_func("skinny_bf12_m3_bf16")?,
+                cuda.get_func("skinny_bf12_m4_bf16")?,
+                cuda.get_func("skinny_bf12_m5_bf16")?,
+            ],
+            lm_head: [
+                cuda.get_func("lm_head_bf12_argmax_m1_bf16")?,
+                cuda.get_func("lm_head_bf12_argmax_m2_bf16")?,
+                cuda.get_func("lm_head_bf12_argmax_m3_bf16")?,
+                cuda.get_func("lm_head_bf12_argmax_m4_bf16")?,
+                cuda.get_func("lm_head_bf12_argmax_m5_bf16")?,
+            ],
+        })
+    }
+}
+
+#[inline]
+pub(crate) fn launch_embed_single_bf12(
+    cuda: &CudaRuntime,
+    bf12: &Bf12DecodeFuncs,
+    tok_id_ptr: CUdeviceptr,
+    emb: Bf12Ptr,
+    out: CUdeviceptr,
+) -> Result<()> {
+    let mut tid_p = tok_id_ptr;
+    let mut sm8 = emb.sm8;
+    let mut exp4 = emb.exp4;
+    let mut rp = emb.row_ptr;
+    let mut ec = emb.esc_col;
+    let mut ev = emb.esc_val;
+    let mut out_p = out;
+    let mut dim = emb.cols as i32;
+    let mut eb = emb.e_base;
+    cuda.launch(
+        bf12.embed_single,
+        (1, 1, 1),
+        (256, 1, 1),
+        &mut [
+            &mut tid_p as *mut _ as *mut c_void,
+            &mut sm8 as *mut _ as *mut c_void,
+            &mut exp4 as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut ec as *mut _ as *mut c_void,
+            &mut ev as *mut _ as *mut c_void,
+            &mut out_p as *mut _ as *mut c_void,
+            &mut dim as *mut _ as *mut c_void,
+            &mut eb as *mut _ as *mut c_void,
+        ],
+    )
+}
+
+#[inline]
+pub(crate) fn launch_embed_prefill_bf12(
+    cuda: &CudaRuntime,
+    bf12: &Bf12DecodeFuncs,
+    tok_ids_ptr: CUdeviceptr,
+    emb: Bf12Ptr,
+    out: CUdeviceptr,
+    seq_len: usize,
+) -> Result<()> {
+    let mut tids_p = tok_ids_ptr;
+    let mut sm8 = emb.sm8;
+    let mut exp4 = emb.exp4;
+    let mut rp = emb.row_ptr;
+    let mut ec = emb.esc_col;
+    let mut ev = emb.esc_val;
+    let mut out_p = out;
+    let mut sl = seq_len as i32;
+    let mut dim = emb.cols as i32;
+    let mut eb = emb.e_base;
+    cuda.launch(
+        bf12.embed_prefill,
+        (seq_len as u32, 1, 1),
+        (256, 1, 1),
+        &mut [
+            &mut tids_p as *mut _ as *mut c_void,
+            &mut sm8 as *mut _ as *mut c_void,
+            &mut exp4 as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut ec as *mut _ as *mut c_void,
+            &mut ev as *mut _ as *mut c_void,
+            &mut out_p as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
+            &mut dim as *mut _ as *mut c_void,
+            &mut eb as *mut _ as *mut c_void,
+        ],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(crate) fn launch_mtp_pre_fc_concat_bf12(
+    cuda: &CudaRuntime,
+    bf12: &Bf12DecodeFuncs,
+    tok_ids_ptr: CUdeviceptr,
+    emb: Bf12Ptr,
+    hid_in: CUdeviceptr,
+    w_en: CUdeviceptr,
+    w_hn: CUdeviceptr,
+    out_cat: CUdeviceptr,
+    m: usize,
+    eps: f32,
+) -> Result<()> {
+    let mut tids_p = tok_ids_ptr;
+    let mut sm8 = emb.sm8;
+    let mut exp4 = emb.exp4;
+    let mut rp = emb.row_ptr;
+    let mut ec = emb.esc_col;
+    let mut ev = emb.esc_val;
+    let mut hin = hid_in;
+    let mut wen = w_en;
+    let mut whn = w_hn;
+    let mut cat = out_cat;
+    let mut dim = emb.cols as i32;
+    let mut eps_v = eps;
+    let mut eb = emb.e_base;
+    cuda.launch(
+        bf12.mtp_pre_fc_concat,
+        (m as u32, 1, 1),
+        (256, 1, 1),
+        &mut [
+            &mut tids_p as *mut _ as *mut c_void,
+            &mut sm8 as *mut _ as *mut c_void,
+            &mut exp4 as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut ec as *mut _ as *mut c_void,
+            &mut ev as *mut _ as *mut c_void,
+            &mut hin as *mut _ as *mut c_void,
+            &mut wen as *mut _ as *mut c_void,
+            &mut whn as *mut _ as *mut c_void,
+            &mut cat as *mut _ as *mut c_void,
+            &mut dim as *mut _ as *mut c_void,
+            &mut eps_v as *mut _ as *mut c_void,
+            &mut eb as *mut _ as *mut c_void,
+        ],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(crate) fn launch_skinny_bf12(
+    cuda: &CudaRuntime,
+    bf12: &Bf12DecodeFuncs,
+    m: usize,
+    x: CUdeviceptr,
+    w: Bf12Ptr,
+    y: CUdeviceptr,
+    add_res: bool,
+) -> Result<()> {
+    let mut x_p = x;
+    let mut sm8 = w.sm8;
+    let mut exp4 = w.exp4;
+    let mut rp = w.row_ptr;
+    let mut ec = w.esc_col;
+    let mut ev = w.esc_val;
+    let mut y_p = y;
+    let mut n_i = w.rows as i32;
+    let mut k_i = w.cols as i32;
+    let mut eb = w.e_base;
+    let mut add_i: i32 = if add_res { 1 } else { 0 };
+    let grid_x = ((w.rows + 7) / 8) as u32;
+    cuda.launch(
+        bf12.skinny[m - 1],
+        (grid_x, 1, 1),
+        (256, 1, 1),
+        &mut [
+            &mut x_p as *mut _ as *mut c_void,
+            &mut sm8 as *mut _ as *mut c_void,
+            &mut exp4 as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut ec as *mut _ as *mut c_void,
+            &mut ev as *mut _ as *mut c_void,
+            &mut y_p as *mut _ as *mut c_void,
+            &mut n_i as *mut _ as *mut c_void,
+            &mut k_i as *mut _ as *mut c_void,
+            &mut eb as *mut _ as *mut c_void,
+            &mut add_i as *mut _ as *mut c_void,
+        ],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(crate) fn launch_lm_head_bf12_argmax(
+    cuda: &CudaRuntime,
+    bf12: &Bf12DecodeFuncs,
+    argmax_s2: CUfunction,
+    argmax_batch_s2: CUfunction,
+    m: usize,
+    x_normed: CUdeviceptr,
+    w: Bf12Ptr,
+    part_vals: CUdeviceptr,
+    part_idxs: CUdeviceptr,
+    out_ids: CUdeviceptr,
+) -> Result<()> {
+    let mut x_p = x_normed;
+    let mut sm8 = w.sm8;
+    let mut exp4 = w.exp4;
+    let mut rp = w.row_ptr;
+    let mut ec = w.esc_col;
+    let mut ev = w.esc_val;
+    let mut av_p = part_vals;
+    let mut ai_p = part_idxs;
+    let mut out_p = out_ids;
+    let mut vocab_i = w.rows as i32;
+    let mut eb = w.e_base;
+    let mut nblk: i32 = 1024;
+    cuda.launch(
+        bf12.lm_head[m - 1],
+        (1024, 1, 1),
+        (256, 1, 1),
+        &mut [
+            &mut x_p as *mut _ as *mut c_void,
+            &mut sm8 as *mut _ as *mut c_void,
+            &mut exp4 as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut ec as *mut _ as *mut c_void,
+            &mut ev as *mut _ as *mut c_void,
+            &mut av_p as *mut _ as *mut c_void,
+            &mut ai_p as *mut _ as *mut c_void,
+            &mut vocab_i as *mut _ as *mut c_void,
+            &mut eb as *mut _ as *mut c_void,
+        ],
+    )?;
+    if m == 1 {
+        cuda.launch(
+            argmax_s2,
+            (1, 1, 1),
+            (256, 1, 1),
+            &mut [
+                &mut av_p as *mut _ as *mut c_void,
+                &mut ai_p as *mut _ as *mut c_void,
+                &mut out_p as *mut _ as *mut c_void,
+                &mut nblk as *mut _ as *mut c_void,
+            ],
+        )
+    } else {
+        cuda.launch(
+            argmax_batch_s2,
+            (1, m as u32, 1),
+            (256, 1, 1),
+            &mut [
+                &mut av_p as *mut _ as *mut c_void,
+                &mut ai_p as *mut _ as *mut c_void,
+                &mut out_p as *mut _ as *mut c_void,
+                &mut nblk as *mut _ as *mut c_void,
+            ],
+        )
+    }
+}
+
+#[inline]
+pub(crate) fn launch_bf12_unpack(
+    cuda: &CudaRuntime,
+    f: &Int8PrefillFuncs,
+    w: Bf12Ptr,
+    dst_bf16: CUdeviceptr,
+) -> Result<()> {
+    let mut sm8 = w.sm8;
+    let mut exp4 = w.exp4;
+    let mut rp = w.row_ptr;
+    let mut ec = w.esc_col;
+    let mut ev = w.esc_val;
+    let mut dst = dst_bf16;
+    let mut n_i = w.rows as i32;
+    let mut k_i = w.cols as i32;
+    let mut eb = w.e_base;
+    cuda.launch(
+        f.bf12_unpack,
+        (w.rows as u32, 1, 1),
+        (256, 1, 1),
+        &mut [
+            &mut sm8 as *mut _ as *mut c_void,
+            &mut exp4 as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut ec as *mut _ as *mut c_void,
+            &mut ev as *mut _ as *mut c_void,
+            &mut dst as *mut _ as *mut c_void,
+            &mut n_i as *mut _ as *mut c_void,
+            &mut k_i as *mut _ as *mut c_void,
+            &mut eb as *mut _ as *mut c_void,
+        ],
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PrefillInt8Mode {
+    Off,
+    Smooth,
+    Ozaki,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Int8PrefillFuncs {
+    pub smooth_scales: CUfunction,
+    pub quant_1s_k4k: CUfunction,
+    pub quant_1s_k10k: CUfunction,
+    pub quant_oz2_k4k: CUfunction,
+    pub quant_oz2_k10k: CUfunction,
+    pub dequant_oz21_vec4: CUfunction,
+    pub quant_strided_k6k: CUfunction,
+    // Phase R12: Custom Ampere PTX IMMA Fused-Dequant GEMM (0 C_i32 DRAM!)
+    pub imma_128x128x64: CUfunction,
+    pub imma_64x128x64: CUfunction,
+    // Phase R14: Direct BF12 -> INT8 SmoothQuant + Fast BF12 -> BF16 Unpack
+    pub quant_bf12_k4k: CUfunction,
+    pub quant_bf12_k10k: CUfunction,
+    pub quant_bf12_strided_k6k: CUfunction,
+    pub bf12_unpack: CUfunction,
+}
+
+impl Int8PrefillFuncs {
+    pub fn load(cuda: &CudaRuntime) -> Result<Self> {
+        Ok(Self {
+            smooth_scales: cuda.get_func("compute_smooth_col_scales_bf16")?,
+            quant_1s_k4k: cuda.get_func("quant_bf16_to_i8_smooth_k4k")?,
+            quant_1s_k10k: cuda.get_func("quant_bf16_to_i8_smooth_k10k")?,
+            quant_oz2_k4k: cuda.get_func("quant_bf16_to_i8_ozaki2_k4k")?,
+            quant_oz2_k10k: cuda.get_func("quant_bf16_to_i8_ozaki2_k10k")?,
+            dequant_oz21_vec4: cuda.get_func("dequant_ozaki2x1_vec4_bf16")?,
+            quant_strided_k6k: cuda.get_func("quant_bf16_to_i8_smooth_strided_k6k")?,
+            imma_128x128x64: cuda.get_func("imma_gemm_dequant_128x128x64_bf16")?,
+            imma_64x128x64: cuda.get_func("imma_gemm_dequant_64x128x64_bf16")?,
+            quant_bf12_k4k: cuda.get_func("quant_bf12_to_i8_smooth_k4k")?,
+            quant_bf12_k10k: cuda.get_func("quant_bf12_to_i8_smooth_k10k")?,
+            quant_bf12_strided_k6k: cuda.get_func("quant_bf12_to_i8_smooth_strided_k6k")?,
+            bf12_unpack: cuda.get_func("bf12_to_bf16_unpack")?,
+        })
+    }
+}
+
+pub(crate) const PF_HEADER_ROWS: usize = 1028;
+pub(crate) const PF_POOL_BYTES: usize = 40 * 1024 * 1024 + 512 * 1024; // 40.50 MiB dynamic pool -> total 1024-mode = 55.57 MiB (-3.5 MiB vs R11!)
+
+#[derive(Clone, Copy)]
+pub(crate) struct PrefillWorkspace {
+    pub p_ids: CUdeviceptr,   // [max_rows] i64
+    pub p_h: CUdeviceptr,     // [max_rows, 2560] bf16
+    pub p_nrm: CUdeviceptr,   // [max_rows, 2560] bf16
+    pub p_del: CUdeviceptr,   // [max_rows, 2560] bf16
+    pub p_pool: CUdeviceptr,  // 39.00 MiB (512-mode) or 40.50 MiB (1024-mode) contiguous pool
+    pub max_rows: usize,      // 516 (compact 46.56 MiB) or 1028 (super-chunk 55.57 MiB)
+    pub pool_bytes: usize,
+}
+
+impl PrefillWorkspace {
+    pub fn alloc_sized(cuda: &CudaRuntime, super_1024: bool) -> Result<(CUdeviceptr, usize, Self)> {
+        let max_rows = if super_1024 { PF_HEADER_ROWS } else { 516 };
+        let pool_bytes = if super_1024 { PF_POOL_BYTES } else { 33 * 1024 * 1024 };
+        let align = |b: usize| (b + 255) & !255;
+        let mut off = 0usize;
+        let mut next = |b: usize| {
+            let cur = off;
+            off += align(b);
+            cur as u64
+        };
+        let o_ids = next(max_rows * 8);
+        let o_h = next(max_rows * 2560 * 2);
+        let o_nrm = next(max_rows * 2560 * 2);
+        let o_del = next(max_rows * 2560 * 2);
+        let o_pool = next(pool_bytes);
+        let arena = cuda.alloc(off)?;
+        let ws = Self {
+            p_ids: arena + o_ids,
+            p_h: arena + o_h,
+            p_nrm: arena + o_nrm,
+            p_del: arena + o_del,
+            p_pool: arena + o_pool,
+            max_rows,
+            pool_bytes,
+        };
+        Ok((arena, off, ws))
+    }
+
+    pub fn alloc(cuda: &CudaRuntime) -> Result<(CUdeviceptr, usize, Self)> {
+        Self::alloc_sized(cuda, true)
+    }
+
+    pub fn header_row_bytes(&self) -> usize { self.max_rows * 2560 * 2 }
+    pub fn is_1024(&self) -> bool { self.max_rows >= 1024 }
+    // Compact MTP 512-token sub-slices inside p_pool (4 + 18 + 9 = 31 MiB; +31..36.02 MiB holds MTP h_copy <= 5.02 MiB!)
+    pub fn p_co_512(&self) -> CUdeviceptr { self.p_pool }
+    pub fn p_big_512(&self) -> CUdeviceptr { self.p_pool + 4 * 1024 * 1024 }
+    pub fn p_med_512(&self) -> CUdeviceptr { self.p_pool + 22 * 1024 * 1024 }
+    pub fn p_mtp_h_copy(&self) -> CUdeviceptr { self.p_pool + 31 * 1024 * 1024 }
+}
+
+/// Phase R12: Dispatch custom Ampere PTX IMMA Fused-Dequant GEMM (`128x128x64` for wide N >= 5120, `64x128x64` for N < 5120).
+/// epilogue_mode: 0 = store BF16, 1 = fused residual add (out += val), 2 = fused SwiGLU (out = SiLU(out) * val).
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn launch_imma_gemm_dequant(
+    cuda: &CudaRuntime,
+    f: &Int8PrefillFuncs,
+    a_i8: CUdeviceptr,
+    b_i8: CUdeviceptr,
+    sa: CUdeviceptr,
+    sb: CUdeviceptr,
+    out: CUdeviceptr,
+    valid_m: usize,
+    n: usize,
+    k: usize,
+    ld_out: usize,
+    n_off: usize,
+    epilogue_mode: i32,
+) -> Result<()> {
+    let mut a_p = a_i8;
+    let mut b_p = b_i8;
+    let mut sa_p = sa;
+    let mut sb_p = sb;
+    let mut out_p = out;
+    let mut m_i = valid_m as i32;
+    let mut n_i = n as i32;
+    let mut k_i = k as i32;
+    let mut ld_i = ld_out as i32;
+    let mut noff_i = n_off as i32;
+    let mut ep_i = epilogue_mode;
+    let use_128 = n >= 5120 && valid_m >= 96;
+    let (func, bm, threads) = if use_128 {
+        (f.imma_128x128x64, 128usize, 256u32)
+    } else {
+        (f.imma_64x128x64, 64usize, 128u32)
+    };
+    let grid_x = ((n + 127) / 128) as u32;
+    let grid_y = ((valid_m + bm - 1) / bm) as u32;
+    cuda.launch(
+        func,
+        (grid_x, grid_y, 1),
+        (threads, 1, 1),
+        &mut [
+            &mut a_p as *mut _ as *mut c_void,
+            &mut b_p as *mut _ as *mut c_void,
+            &mut sa_p as *mut _ as *mut c_void,
+            &mut sb_p as *mut _ as *mut c_void,
+            &mut out_p as *mut _ as *mut c_void,
+            &mut m_i as *mut _ as *mut c_void,
+            &mut n_i as *mut _ as *mut c_void,
+            &mut k_i as *mut _ as *mut c_void,
+            &mut ld_i as *mut _ as *mut c_void,
+            &mut noff_i as *mut _ as *mut c_void,
+            &mut ep_i as *mut _ as *mut c_void,
+        ],
+    )
+}
+
+/// Phase R10 + R11 + R12 + R14: Online SmoothQuant (Direct BF12->INT8 + Custom PTX IMMA) + Ozaki + Short BF12 Unpack.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_prefill_gemm_i8(
+    cuda: &CudaRuntime,
+    f: &Int8PrefillFuncs,
+    residual_add_fn: CUfunction,
+    mode: PrefillInt8Mode,
+    m: usize,
+    n: usize,
+    k: usize,
+    max_m_pad: usize,
+    a: CUdeviceptr,
+    b: Bf12Ptr,
+    w_unpack_buf: CUdeviceptr,
+    out_dst: CUdeviceptr,
+    delta_fallback: CUdeviceptr,
+    add_residual: bool,
+    scratch1: CUdeviceptr,
+    scratch1_bytes: usize,
+    scratch2: CUdeviceptr,
+    scratch2_bytes: usize,
+) -> Result<()> {
+    let m_pad = (m + 3) & !3;
+    if mode == PrefillInt8Mode::Off || m < 64 || m_pad > max_m_pad || (n & 15) != 0 || (k & 255) != 0 {
+        launch_bf12_unpack(cuda, f, b, w_unpack_buf)?;
+        if add_residual {
+            cuda.gemm_bf16_nt(m, n, k, a, w_unpack_buf, delta_fallback)?;
+            let mut h_p = out_dst;
+            let mut del_p = delta_fallback;
+            let mut total_h: i32 = (m * n) as i32;
+            let blocks = ((m * n + 255) / 256) as u32;
+            cuda.launch(
+                residual_add_fn,
+                (blocks, 1, 1),
+                (256, 1, 1),
+                &mut [
+                    &mut h_p as *mut _ as *mut c_void,
+                    &mut del_p as *mut _ as *mut c_void,
+                    &mut total_h as *mut _ as *mut c_void,
+                ],
+            )?;
+        } else {
+            cuda.gemm_bf16_nt(m, n, k, a, w_unpack_buf, out_dst)?;
+        }
+        return Ok(());
+    }
+
+    let align256 = |x: usize| (x + 255) & !255;
+    let is_ozaki = mode == PrefillInt8Mode::Ozaki;
+    let a_slices = if is_ozaki { 2usize } else { 1usize };
+
+    let mut off = 0usize;
+    let mut take1 = |sz: usize| -> CUdeviceptr {
+        let p = scratch1 + off as u64;
+        off += align256(sz);
+        p
+    };
+    let p_sm_s = take1(k * 4);
+    let p_sm_inv = take1(k * 4);
+    let p_sa0 = take1(m_pad * 4);
+    let p_sa1 = if is_ozaki { take1(m_pad * 4) } else { 0 };
+    let p_a_i8 = take1(a_slices * m_pad * k);
+
+    let (n_strip, p_sb0, p_b_i8, p_c_i32) = if !is_ozaki {
+        // Phase R12 Smooth PTX-IMMA: ZERO C_i32 allocation! per_col = 4 + k only -> 2x larger strips (1-shot QKV @ 512, 2-strip DN_in)!
+        let (base, rem) = if scratch2 != 0 {
+            (scratch2, scratch2_bytes.saturating_sub(512))
+        } else {
+            (scratch1 + off as u64, scratch1_bytes.saturating_sub(off + 512))
+        };
+        let per_col = 4 + k;
+        let max_n = rem / per_col;
+        let ns = if max_n >= n {
+            n
+        } else {
+            let cap = (max_n & !127).max(128);
+            let num_s = (n + cap - 1) / cap;
+            let even = ((n + num_s - 1) / num_s + 127) & !127;
+            even.min(cap)
+        };
+        let sb0 = base;
+        let bi8 = sb0 + align256(ns * 4) as u64;
+        (ns, sb0, bi8, 0u64)
+    } else if scratch2 != 0 {
+        // Ozaki Split-Buffer Mode: scratch1 holds scales+A_i8, scratch2 holds sB0+B_i8+C_i32
+        let rem2 = scratch2_bytes.saturating_sub(512);
+        let per_col = 4 + k + a_slices * m_pad * 4;
+        let max_n = rem2 / per_col;
+        let ns = if max_n >= n { n } else { max_n & !15 };
+        let sb0 = scratch2;
+        let bi8 = sb0 + align256(ns * 4) as u64;
+        let ci32 = bi8 + align256(ns * k) as u64;
+        (ns, sb0, bi8, ci32)
+    } else {
+        let rem1 = scratch1_bytes.saturating_sub(off + 512);
+        let per_col = 4 + k + a_slices * m_pad * 4;
+        let max_n = rem1 / per_col;
+        let ns = if max_n >= n { n } else { max_n & !15 };
+        let sb0 = scratch1 + off as u64;
+        let bi8 = sb0 + align256(ns * 4) as u64;
+        let ci32 = bi8 + align256(ns * k) as u64;
+        (ns, sb0, bi8, ci32)
+    };
+    debug_assert!(n_strip >= 16 && (n_strip & 15) == 0);
+
+    // 1. Online SmoothQuant per-column scale (alpha = 0.50) from A [m, k]
+    let mut a_p = a;
+    let mut sms_p = p_sm_s;
+    let mut sminv_p = p_sm_inv;
+    let mut m_i: i32 = m as i32;
+    let mut k_i: i32 = k as i32;
+    let mut alpha: f32 = 0.50;
+    cuda.launch(
+        f.smooth_scales,
+        ((k / 32) as u32, 1, 1),
+        (32, 8, 1),
+        &mut [
+            &mut a_p as *mut _ as *mut c_void,
+            &mut sms_p as *mut _ as *mut c_void,
+            &mut sminv_p as *mut _ as *mut c_void,
+            &mut m_i as *mut _ as *mut c_void,
+            &mut k_i as *mut _ as *mut c_void,
+            &mut alpha as *mut _ as *mut c_void,
+        ],
+    )?;
+
+    // 2. Single-Pass Register-Cached Quantize A -> A_i8
+    let q1_fn = if k <= 4096 { f.quant_1s_k4k } else { f.quant_1s_k10k };
+    let qoz_fn = if k <= 4096 { f.quant_oz2_k4k } else { f.quant_oz2_k10k };
+    let mut ai8_p = p_a_i8;
+    let mut sa0_p = p_sa0;
+    if is_ozaki {
+        let mut ai8_1_p = p_a_i8 + (m_pad * k) as u64;
+        let mut sa1_p = p_sa1;
+        cuda.launch(
+            qoz_fn,
+            (m_pad as u32, 1, 1),
+            (256, 1, 1),
+            &mut [
+                &mut a_p as *mut _ as *mut c_void,
+                &mut sminv_p as *mut _ as *mut c_void,
+                &mut ai8_p as *mut _ as *mut c_void,
+                &mut ai8_1_p as *mut _ as *mut c_void,
+                &mut sa0_p as *mut _ as *mut c_void,
+                &mut sa1_p as *mut _ as *mut c_void,
+                &mut m_i as *mut _ as *mut c_void,
+                &mut k_i as *mut _ as *mut c_void,
+            ],
+        )?;
+    } else {
+        cuda.launch(
+            q1_fn,
+            (m as u32, 1, 1),
+            (256, 1, 1),
+            &mut [
+                &mut a_p as *mut _ as *mut c_void,
+                &mut sminv_p as *mut _ as *mut c_void,
+                &mut ai8_p as *mut _ as *mut c_void,
+                &mut sa0_p as *mut _ as *mut c_void,
+                &mut m_i as *mut _ as *mut c_void,
+                &mut k_i as *mut _ as *mut c_void,
+            ],
+        )?;
+    }
+
+    // 3. N-Strip Loop: Single-Pass Direct BF12->INT8 Quantize B_strip -> PTX-IMMA Fused-Dequant (Smooth) or cuBLAS INT8 (Ozaki)
+    let q1_bf12_fn = if k <= 4096 { f.quant_bf12_k4k } else { f.quant_bf12_k10k };
+    let mut ld_out_i: i32 = n as i32;
+    let mut add_res_i: i32 = if add_residual { 1 } else { 0 };
+    let mut m_pad_i: i32 = m_pad as i32;
+    let mut out_p = out_dst;
+    let mut sb0_p = p_sb0;
+    let mut bi8_p = p_b_i8;
+    let mut ci32_p = p_c_i32;
+
+    let mut n0 = 0usize;
+    while n0 < n {
+        let ns = n_strip.min(n - n0);
+        let b_strip = b.slice_rows(n0, ns);
+        let mut sm8 = b_strip.sm8;
+        let mut exp4 = b_strip.exp4;
+        let mut rp = b_strip.row_ptr;
+        let mut ec = b_strip.esc_col;
+        let mut ev = b_strip.esc_val;
+        let mut eb = b_strip.e_base;
+        let mut ns_i: i32 = ns as i32;
+        let mut n0_i: i32 = n0 as i32;
+
+        cuda.launch(
+            q1_bf12_fn,
+            (ns as u32, 1, 1),
+            (256, 1, 1),
+            &mut [
+                &mut sm8 as *mut _ as *mut c_void,
+                &mut exp4 as *mut _ as *mut c_void,
+                &mut rp as *mut _ as *mut c_void,
+                &mut ec as *mut _ as *mut c_void,
+                &mut ev as *mut _ as *mut c_void,
+                &mut sms_p as *mut _ as *mut c_void,
+                &mut bi8_p as *mut _ as *mut c_void,
+                &mut sb0_p as *mut _ as *mut c_void,
+                &mut ns_i as *mut _ as *mut c_void,
+                &mut k_i as *mut _ as *mut c_void,
+                &mut eb as *mut _ as *mut c_void,
+            ],
+        )?;
+
+        if !is_ozaki {
+            launch_imma_gemm_dequant(
+                cuda, f, p_a_i8, p_b_i8, p_sa0, p_sb0, out_dst,
+                m, ns, k, n, n0, if add_residual { 1 } else { 0 },
+            )?;
+        } else {
+            cuda.gemm_i8_nt(a_slices * m_pad, ns, k, p_a_i8, p_b_i8, p_c_i32)?;
+            let total4 = m * (ns >> 2);
+            let blocks = ((total4 + 255) / 256) as u32;
+            let mut sa1_p = p_sa1;
+            cuda.launch(
+                f.dequant_oz21_vec4,
+                (blocks, 1, 1),
+                (256, 1, 1),
+                &mut [
+                    &mut ci32_p as *mut _ as *mut c_void,
+                    &mut sa0_p as *mut _ as *mut c_void,
+                    &mut sa1_p as *mut _ as *mut c_void,
+                    &mut sb0_p as *mut _ as *mut c_void,
+                    &mut out_p as *mut _ as *mut c_void,
+                    &mut m_i as *mut _ as *mut c_void,
+                    &mut m_pad_i as *mut _ as *mut c_void,
+                    &mut ns_i as *mut _ as *mut c_void,
+                    &mut ld_out_i as *mut _ as *mut c_void,
+                    &mut n0_i as *mut _ as *mut c_void,
+                    &mut add_res_i as *mut _ as *mut c_void,
+                ],
+            )?;
+        }
+        n0 += ns;
+    }
+    Ok(())
+}
+
+/// Phase R11 + R12: Fused Tiled SwiGLU-MLP on Custom Ampere PTX IMMA Tensor Cores (ZERO C_i32, ZERO dequant launches!).
+/// Always uses I_tile = 4608 (ONLY 2 tiles for BOTH M <= 512 AND M <= 1024!):
+///   1) gate_tile = X @ W_gate_tile^T -> p_act_tile [M, 4608] (epilogue=0)
+///   2) up_tile   = X @ W_up_tile^T + IN-REGISTER SiLU(gate_tile) * up_tile -> p_act_tile in-place! (epilogue=2)
+///   3) H += p_act_tile @ W_down_tile^T + IN-REGISTER residual add into H! (epilogue=1)
+/// Fits in <= 24.75 MiB pool at M=1024 (<= 18.00 MiB at M=512)!
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_prefill_fused_tiled_mlp_i8(
+    cuda: &CudaRuntime,
+    f: &Int8PrefillFuncs,
+    m: usize,
+    x_normed: CUdeviceptr,
+    w_gate_up: Bf12Ptr,
+    w_down: Bf12Ptr,
+    h_inout: CUdeviceptr,
+    a_scratch: CUdeviceptr,
+    pool: CUdeviceptr,
+) -> Result<()> {
+    let m_pad = (m + 3) & !3;
+    const D: usize = 2560;
+    const INTER: usize = 9216;
+    const I_TILE: usize = 4608;
+    let align256 = |x: usize| (x + 255) & !255;
+
+    // Partition a_scratch: separate scale buffers for X and Act so X scales persist across both tiles!
+    let mut off_a = 0usize;
+    let mut take_a = |sz: usize| -> CUdeviceptr {
+        let p = a_scratch + off_a as u64;
+        off_a += align256(sz);
+        p
+    };
+    let p_sm_s_x = take_a(D * 4);
+    let p_sm_inv_x = take_a(D * 4);
+    let p_sa_x = take_a(m_pad * 4);
+    let p_sm_s_a = take_a(I_TILE * 4);
+    let p_sm_inv_a = take_a(I_TILE * 4);
+    let p_sa_a = take_a(m_pad * 4);
+    let p_sb = take_a(I_TILE * 4);
+    let p_ax_i8 = take_a(m_pad * D);
+
+    // Partition pool (ZERO C_i32 -> peak <= 24.75 MiB at M=1024, <= 18.00 MiB at M=512!)
+    let mut off_p = 0usize;
+    let mut take_p = |sz: usize| -> CUdeviceptr {
+        let p = pool + off_p as u64;
+        off_p += align256(sz);
+        p
+    };
+    let p_act_tile = take_p(m_pad * I_TILE * 2);
+    let p_act_i8 = take_p(m_pad * I_TILE);
+    let p_b_i8 = take_p(I_TILE * D);
+
+    // 1. Compute SmoothQuant scales & quantize X_normed ONCE for both tiles!
+    let mut x_p = x_normed;
+    let mut sm_sx = p_sm_s_x;
+    let mut sm_ix = p_sm_inv_x;
+    let mut m_i: i32 = m as i32;
+    let mut d_i: i32 = D as i32;
+    let mut inter_i: i32 = INTER as i32;
+    let mut it_i: i32 = I_TILE as i32;
+    let mut alpha: f32 = 0.50;
+    cuda.launch(
+        f.smooth_scales,
+        ((D / 32) as u32, 1, 1),
+        (32, 8, 1),
+        &mut [
+            &mut x_p as *mut _ as *mut c_void,
+            &mut sm_sx as *mut _ as *mut c_void,
+            &mut sm_ix as *mut _ as *mut c_void,
+            &mut m_i as *mut _ as *mut c_void,
+            &mut d_i as *mut _ as *mut c_void,
+            &mut alpha as *mut _ as *mut c_void,
+        ],
+    )?;
+
+    let mut ax_i8_p = p_ax_i8;
+    let mut sax_p = p_sa_x;
+    cuda.launch(
+        f.quant_1s_k4k,
+        (m as u32, 1, 1),
+        (256, 1, 1),
+        &mut [
+            &mut x_p as *mut _ as *mut c_void,
+            &mut sm_ix as *mut _ as *mut c_void,
+            &mut ax_i8_p as *mut _ as *mut c_void,
+            &mut sax_p as *mut _ as *mut c_void,
+            &mut m_i as *mut _ as *mut c_void,
+            &mut d_i as *mut _ as *mut c_void,
+        ],
+    )?;
+
+    let mut act_p = p_act_tile;
+    let mut act_i8_p = p_act_i8;
+    let mut b_i8_p = p_b_i8;
+    let mut sm_sa = p_sm_s_a;
+    let mut sm_ia = p_sm_inv_a;
+    let mut saa_p = p_sa_a;
+    let mut sb_p = p_sb;
+    let mut zero_i: i32 = 0;
+
+    let mut i0 = 0usize;
+    while i0 < INTER {
+        let mut i0_i: i32 = i0 as i32;
+
+        // 2a. Gate tile: Direct BF12->INT8 + PTX-IMMA -> p_act_tile (epilogue = 0)
+        let wg = w_gate_up.slice_rows(i0, I_TILE);
+        let mut wg_sm8 = wg.sm8;
+        let mut wg_ex4 = wg.exp4;
+        let mut wg_rp = wg.row_ptr;
+        let mut wg_ec = wg.esc_col;
+        let mut wg_ev = wg.esc_val;
+        let mut wg_eb = wg.e_base;
+        cuda.launch(
+            f.quant_bf12_k4k,
+            (I_TILE as u32, 1, 1),
+            (256, 1, 1),
+            &mut [
+                &mut wg_sm8 as *mut _ as *mut c_void,
+                &mut wg_ex4 as *mut _ as *mut c_void,
+                &mut wg_rp as *mut _ as *mut c_void,
+                &mut wg_ec as *mut _ as *mut c_void,
+                &mut wg_ev as *mut _ as *mut c_void,
+                &mut sm_sx as *mut _ as *mut c_void,
+                &mut b_i8_p as *mut _ as *mut c_void,
+                &mut sb_p as *mut _ as *mut c_void,
+                &mut it_i as *mut _ as *mut c_void,
+                &mut d_i as *mut _ as *mut c_void,
+                &mut wg_eb as *mut _ as *mut c_void,
+            ],
+        )?;
+        launch_imma_gemm_dequant(
+            cuda, f, p_ax_i8, p_b_i8, p_sa_x, p_sb, p_act_tile,
+            m, I_TILE, D, I_TILE, 0, 0,
+        )?;
+
+        // 2b. Up tile: Direct BF12->INT8 + IN-REGISTER FUSED SiLU(gate) * up -> p_act_tile IN-PLACE (epilogue = 2)!
+        let wu = w_gate_up.slice_rows(INTER + i0, I_TILE);
+        let mut wu_sm8 = wu.sm8;
+        let mut wu_ex4 = wu.exp4;
+        let mut wu_rp = wu.row_ptr;
+        let mut wu_ec = wu.esc_col;
+        let mut wu_ev = wu.esc_val;
+        let mut wu_eb = wu.e_base;
+        cuda.launch(
+            f.quant_bf12_k4k,
+            (I_TILE as u32, 1, 1),
+            (256, 1, 1),
+            &mut [
+                &mut wu_sm8 as *mut _ as *mut c_void,
+                &mut wu_ex4 as *mut _ as *mut c_void,
+                &mut wu_rp as *mut _ as *mut c_void,
+                &mut wu_ec as *mut _ as *mut c_void,
+                &mut wu_ev as *mut _ as *mut c_void,
+                &mut sm_sx as *mut _ as *mut c_void,
+                &mut b_i8_p as *mut _ as *mut c_void,
+                &mut sb_p as *mut _ as *mut c_void,
+                &mut it_i as *mut _ as *mut c_void,
+                &mut d_i as *mut _ as *mut c_void,
+                &mut wu_eb as *mut _ as *mut c_void,
+            ],
+        )?;
+        launch_imma_gemm_dequant(
+            cuda, f, p_ax_i8, p_b_i8, p_sa_x, p_sb, p_act_tile,
+            m, I_TILE, D, I_TILE, 0, 2,
+        )?;
+
+        // 2c. Down tile: p_act_tile @ W_down[:, i0..i0+4608]^T + IN-REGISTER residual add into H (epilogue = 1)!
+        cuda.launch(
+            f.smooth_scales,
+            ((I_TILE / 32) as u32, 1, 1),
+            (32, 8, 1),
+            &mut [
+                &mut act_p as *mut _ as *mut c_void,
+                &mut sm_sa as *mut _ as *mut c_void,
+                &mut sm_ia as *mut _ as *mut c_void,
+                &mut m_i as *mut _ as *mut c_void,
+                &mut it_i as *mut _ as *mut c_void,
+                &mut alpha as *mut _ as *mut c_void,
+            ],
+        )?;
+        cuda.launch(
+            f.quant_strided_k6k,
+            (m as u32, 1, 1),
+            (256, 1, 1),
+            &mut [
+                &mut act_p as *mut _ as *mut c_void,
+                &mut sm_ia as *mut _ as *mut c_void,
+                &mut act_i8_p as *mut _ as *mut c_void,
+                &mut saa_p as *mut _ as *mut c_void,
+                &mut m_i as *mut _ as *mut c_void,
+                &mut it_i as *mut _ as *mut c_void,
+                &mut it_i as *mut _ as *mut c_void,
+                &mut zero_i as *mut _ as *mut c_void,
+            ],
+        )?;
+        let mut wd_sm8 = w_down.sm8;
+        let mut wd_ex4 = w_down.exp4;
+        let mut wd_rp = w_down.row_ptr;
+        let mut wd_ec = w_down.esc_col;
+        let mut wd_ev = w_down.esc_val;
+        let mut wd_eb = w_down.e_base;
+        cuda.launch(
+            f.quant_bf12_strided_k6k,
+            (D as u32, 1, 1),
+            (256, 1, 1),
+            &mut [
+                &mut wd_sm8 as *mut _ as *mut c_void,
+                &mut wd_ex4 as *mut _ as *mut c_void,
+                &mut wd_rp as *mut _ as *mut c_void,
+                &mut wd_ec as *mut _ as *mut c_void,
+                &mut wd_ev as *mut _ as *mut c_void,
+                &mut sm_sa as *mut _ as *mut c_void,
+                &mut b_i8_p as *mut _ as *mut c_void,
+                &mut sb_p as *mut _ as *mut c_void,
+                &mut d_i as *mut _ as *mut c_void,
+                &mut it_i as *mut _ as *mut c_void,
+                &mut inter_i as *mut _ as *mut c_void,
+                &mut i0_i as *mut _ as *mut c_void,
+                &mut wd_eb as *mut _ as *mut c_void,
+            ],
+        )?;
+        launch_imma_gemm_dequant(
+            cuda, f, p_act_i8, p_b_i8, p_sa_a, p_sb, h_inout,
+            m, D, I_TILE, D, 0, 1,
+        )?;
+        i0 += I_TILE;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -100,7 +1027,7 @@ pub(crate) fn run_deltanet_prefill_wy(
     rec_state: CUdeviceptr,
     rec_snap_out: CUdeviceptr,
     dn_raw: CUdeviceptr,
-    ws_big: CUdeviceptr,
+    wy_tail: CUdeviceptr,
     core_out: CUdeviceptr,
     seq_len: usize,
     use_init_state: i32,
@@ -124,13 +1051,13 @@ pub(crate) fn run_deltanet_prefill_wy(
 
     // Zero-extra-VRAM BF16 buffer map for B_c <= 4 chunks (256 tokens/tile):
     //   dn_raw (8.00 MiB): buf_q (2M) | buf_k (2M) | buf_w (2M) | buf_u (2M)
-    //   ws_big + 12.50 MiB (5.50 MiB free): buf_t (1M) | buf_a (1M) | buf_tmp (2M) | buf_g/beta/g_last (65 KB)
+    //   wy_tail (>= 4.10 MiB): buf_t (1M) | buf_a (1M) | buf_tmp (2M) | buf_g/beta/g_last (65 KB)
     let buf_q = dn_raw;
     let buf_k = dn_raw + 2_097_152;
     let buf_w = dn_raw + 4_194_304;
     let buf_u = dn_raw + 6_291_456;
 
-    let tail = ws_big + 13_107_200;
+    let tail = wy_tail;
     let buf_t = tail;
     let buf_a = tail + 1_048_576;
     let buf_tmp = tail + 2_097_152;
@@ -318,29 +1245,22 @@ impl KernelFuncs {
             prefill_gqa_causal_gated: cuda.get_func("prefill_gqa_causal_gated_bf16")?,
             gqa_flash_splitk: cuda.get_func("gqa_decode_flash_splitk_bf16")?,
             gqa_flash_reduce: cuda.get_func("gqa_decode_flash_reduce_bf16")?,
-            embed_single: cuda.get_func("embed_lookup_single_bf16")?,
-            embed_prefill: cuda.get_func("embed_lookup_prefill_bf16")?,
-            argmax_stage1: cuda.get_func("argmax_stage1_bf16")?,
             argmax_stage2: cuda.get_func("argmax_stage2_bf16")?,
             inc_pos: cuda.get_func("inc_pos_i32")?,
             copy_i64: cuda.get_func("copy_i64")?,
-            mtp_pre_fc_concat: cuda.get_func("mtp_pre_fc_concat_bf16")?,
             conv1d_verify_m: cuda.get_func("causal_conv1d_verify_m_bf16")?,
             deltanet_verify_m: cuda.get_func("gated_deltanet_verify_m_bf16")?,
             deltanet_commit_partial: cuda.get_func("deltanet_commit_partial_bf16")?,
             qk_rope_kv_verify_m: cuda.get_func("full_attn_qk_rope_kv_verify_m_bf16")?,
             gqa_verify_m_splitk: cuda.get_func("gqa_verify_m_flash_splitk_bf16")?,
             gqa_verify_m_reduce: cuda.get_func("gqa_verify_m_flash_reduce_bf16")?,
-            argmax_batch_stage1: cuda.get_func("argmax_batch_stage1_bf16")?,
             argmax_batch_stage2: cuda.get_func("argmax_batch_stage2_bf16")?,
-            skinny_gemm_m1: cuda.get_func("skinny_gemm_m1_2wpr_bf16")?,
-            skinny_gemm_m2: cuda.get_func("skinny_gemm_m2_1wpr_bf16")?,
-            skinny_gemm_m3: cuda.get_func("skinny_gemm_m3_1wpr_bf16")?,
-            skinny_gemm_m4: cuda.get_func("skinny_gemm_m4_1wpr_bf16")?,
             wy: WyKernelFuncs::load(cuda)?,
             conv1d_prefill_2d: cuda.get_func("causal_conv1d_prefill_2d_bf16")?,
             conv1d_update_state: cuda.get_func("causal_conv1d_update_state_bf16")?,
-            prefill_gqa_wmma: cuda.get_func("prefill_gqa_wmma_causal_gated_bf16")?,
+            r10: Int8PrefillFuncs::load(cuda)?,
+            prefill_gqa_wmma_32x16: cuda.get_func("prefill_gqa_wmma_32x16_causal_gated_bf16")?,
+            bf12: Bf12DecodeFuncs::load(cuda)?,
         })
     }
 }
@@ -565,11 +1485,10 @@ struct MtpRuntime {
     v_q_rot: CUdeviceptr,     // [4, 16, 256] bf16
     v_flash_out: CUdeviceptr, // [4, 16, 4, 256] f32
     v_flash_ml: CUdeviceptr,  // [4, 16, 4, 2] f32
-    v_mlp_gu: CUdeviceptr,    // [4, 18432] bf16
-    v_mlp_act: CUdeviceptr,   // [4, 9216] bf16
-    v_logits: CUdeviceptr,    // [4, vocab_size] bf16
-    v_arg_vals: CUdeviceptr,  // [4, 256] f32
-    v_arg_idxs: CUdeviceptr,  // [4, 256] i32
+    v_mlp_gu: CUdeviceptr,    // [5, 18432] bf16
+    v_mlp_act: CUdeviceptr,   // [5, 9216] bf16
+    v_arg_vals: CUdeviceptr,  // [5, 1024] f32 (Phase R14: v_logits freed!)
+    v_arg_idxs: CUdeviceptr,  // [5, 1024] i32
     // MTP single/batch step buffers
     mtp_cat: CUdeviceptr,     // [4, 5120] bf16
     mtp_h: CUdeviceptr,       // [4, 2560] bf16
@@ -637,9 +1556,11 @@ pub struct RustSplitEngine {
     s_arg_idxs: CUdeviceptr,   // [256] i32
     s_live_last_h: CUdeviceptr,// [2560] bf16 (5 KB on GPU for Tier 0 Hot-Cache MTP boundary!)
 
-    // Reusable prefill scratch buffer (allocated once on demand up to max_seq)
+    // Reusable compact Prefill Workspace + shared 90.0 MiB BF12->BF16 unpack scratch
     pf_arena: CUdeviceptr,
-    pf_cap_seq: usize,
+    pf_bytes: usize,
+    pf_ws: PrefillWorkspace,
+    w_unpack_buf: CUdeviceptr,
 
     // Pinned host ping-pong slots & CUDA events for Zero-Bubble SSE Overlap
     h_tok_slots: [*mut i64; 2],
@@ -652,6 +1573,8 @@ pub struct RustSplitEngine {
 
     // Phase R6.1: toggle custom skinny GEMM on M=2..4 wide projections (dn_in, fa_qkv, mlp_gu) for A/B tuning
     skinny_m4_wide: bool,
+    // Phase R10: Online SmoothQuant / Ozaki INT8 Tensor Core Prefill mode
+    prefill_int8: PrefillInt8Mode,
 
     // Phase R4: 3-Tier Hybrid Prefix Cache (Tier 0 GPU Hot-Cache + Tier 1 Pinned-RAM Pool, 0 MiB extra VRAM!)
     live_tokens: Vec<i64>,
@@ -708,6 +1631,7 @@ impl RustSplitEngine {
         prefix_cache_slots: usize,
         force_max_seq: bool,
         skinny_m4_wide: bool,
+        prefill_int8: PrefillInt8Mode,
     ) -> Result<Self> {
         let t0 = Instant::now();
         let cfg = TextConfig::load(model_dir)?;
@@ -717,12 +1641,16 @@ impl RustSplitEngine {
 
         let weights = load_split_weights(&cuda, model_dir, &cfg, split_layer, mtp_drafts > 0)?;
 
-        // Phase R6.1 + R9: Bulletproof Windows WDDM VRAM Headroom Guard (prevents silent PCIe paging drops!)
+        // Phase R6.1 + R9 + R13: Bulletproof Windows WDDM VRAM Headroom Guard (prevents silent PCIe paging drops!)
+        let free_after_weights_mib = cuda.mem_info().map(|(f, _)| f as f64 / 1048576.0).unwrap_or(1000.0);
+        // Phase R13: Adaptive MTP rec_final (48 MiB) — only allocate when prefix cache is enabled AND free VRAM >= 640 MiB!
+        // Skipping rec_final saves 48.0 MiB permanent VRAM AND skips 48 MB DRAM write on every Verify pass!
+        let alloc_mtp_rec_final = mtp_drafts > 0 && prefix_cache_slots > 0 && free_after_weights_mib >= 640.0;
         if !force_max_seq {
-            let (free_b, _) = cuda.mem_info()?;
-            let free_mib = free_b as f64 / 1048576.0;
-            // Fixed allocations after weights: DeltaNet states (50) + Scratch (2) + MTP rollback (55) + pf_arena (47) + Graph/cuBLAS runtime (~70)
-            let fixed_mib = 50.0 + 2.0 + if mtp_drafts > 0 { 55.0 } else { 0.0 } + 47.0 + 70.0;
+            let free_mib = free_after_weights_mib;
+            // Fixed allocations after weights: DeltaNet states (50) + Scratch (1) + MTP rollback (8 or 56) + pf_arena (40.6) + w_unpack (90) + Graph/cuBLAS (~70)
+            let mtp_fixed_mib = if mtp_drafts > 0 { if alloc_mtp_rec_final { 56.0 } else { 8.0 } } else { 0.0 };
+            let fixed_mib = 50.0 + 1.0 + mtp_fixed_mib + 40.6 + 90.0 + 70.0;
             let kv_layers = if mtp_drafts > 0 { 9.0 } else { 8.0 };
             // Keep >= 450 MiB headroom at startup so opening Chrome/UI never crosses the ~380 MiB WDDM paging cliff!
             let wddm_guard_mib = 450.0;
@@ -738,8 +1666,8 @@ impl RustSplitEngine {
                 }
                 max_seq = chosen.min(req);
                 println!(
-                    "[RustSplitServer] WDDM VRAM Guard: free={:.1} MiB after weights -> clamped max_seq {} -> {} to keep >= {:.0} MiB headroom (pass --force-max-seq to override)",
-                    free_mib, req, max_seq, wddm_guard_mib
+                    "[RustSplitServer] WDDM VRAM Guard: free={:.1} MiB after weights -> clamped max_seq {} -> {} (rec_final={}) to keep >= {:.0} MiB headroom (pass --force-max-seq to override)",
+                    free_mib, req, max_seq, alloc_mtp_rec_final, wddm_guard_mib
                 );
             }
         }
@@ -781,9 +1709,9 @@ impl RustSplitEngine {
         let o_fm = next(16 * 4 * 2 * 4);
         let o_gu = next(2 * 18432 * 2);
         let o_ac = next(2 * 9216 * 2);
-        let o_lg = next(2 * cfg.vocab_size * 2);
-        let o_av = next(256 * 4);
-        let o_ai = next(256 * 4);
+        let o_lg = next(16); // Phase R13: s_logits freed (-0.95 MiB) — M=1 uses fused lm_head_argmax!
+        let o_av = next(1024 * 4);
+        let o_ai = next(1024 * 4);
         let o_lh = next(2560 * 2);
 
         let scratch_arena = cuda.alloc(off)?;
@@ -795,10 +1723,10 @@ impl RustSplitEngine {
         let ev0 = cuda.create_event()?;
         let ev1 = cuda.create_event()?;
 
-        // Optional Phase R3 MTP Runtime allocation
+        // Optional Phase R3 + R13 MTP Runtime allocation (supports K = 1..4, M = verify_m <= 5!)
         let mtp_rt = if mtp_drafts > 0 {
             if let Some(mw) = weights.mtp {
-                let dk = mtp_drafts.clamp(1, 3);
+                let dk = mtp_drafts.clamp(1, 4);
                 let vm = dk + 1;
                 let mut moff = 0usize;
                 let mut mnext = |b: usize| {
@@ -809,29 +1737,29 @@ impl RustSplitEngine {
                 let kv_sz = 4 * max_seq * 256 * 2;
                 let o_mk = mnext(kv_sz);
                 let o_mv = mnext(kv_sz);
-                let o_vtok = mnext(4 * 8);
-                let o_vout = mnext(4 * 8);
+                let o_vtok = mnext(vm * 8);
+                let o_vout = mnext(vm * 8);
                 let o_vpos = mnext(4);
-                let o_vhid = mnext(4 * 2560 * 2);
-                let o_vbr = mnext(4 * 2560 * 2);
-                let o_vnrm = mnext(4 * 2560 * 2);
-                let o_vdel = mnext(4 * 2560 * 2);
-                let o_vdn = mnext(4 * 12352 * 2);
-                let o_vraw = mnext(4 * 4096 * 4);
-                let o_vco = mnext(4 * 4096 * 2);
-                let o_vfa = mnext(4 * 10240 * 2);
-                let o_vqr = mnext(4 * 16 * 256 * 2);
-                let o_vfo = mnext(4 * 16 * 4 * 256 * 4);
-                let o_vfm = mnext(4 * 16 * 4 * 2 * 4);
-                let o_vgu = mnext(4 * 18432 * 2);
-                let o_vac = mnext(4 * 9216 * 2);
-                let o_vlg = mnext(4 * cfg.vocab_size * 2);
-                let o_vav = mnext(4 * 256 * 4);
-                let o_vai = mnext(4 * 256 * 4);
-                let o_mcat = mnext(4 * 5120 * 2);
-                let o_mh = mnext(4 * 2560 * 2);
-                let o_mhn = mnext(4 * 2560 * 2);
-                let o_mtid = mnext(4 * 8);
+                let o_vhid = mnext(vm * 2560 * 2);
+                let o_vbr = mnext(vm * 2560 * 2);
+                let o_vnrm = mnext(vm * 2560 * 2);
+                let o_vdel = mnext(vm * 2560 * 2);
+                let o_vdn = mnext(vm * 12352 * 2);
+                let o_vraw = mnext(vm * 4096 * 4);
+                let o_vco = mnext(vm * 4096 * 2);
+                let o_vfa = mnext(vm * 10240 * 2);
+                let o_vqr = mnext(vm * 16 * 256 * 2);
+                let o_vfo = mnext(vm * 16 * 4 * 256 * 4);
+                let o_vfm = mnext(vm * 16 * 4 * 2 * 4);
+                let o_vgu = mnext(vm * 18432 * 2);
+                let o_vac = mnext(vm * 9216 * 2);
+                // Phase R14: v_logits freed (-2.4 MiB) — Verify uses lm_head_bf12_argmax_m{2..5}!
+                let o_vav = mnext(vm * 1024 * 4);
+                let o_vai = mnext(vm * 1024 * 4);
+                let o_mcat = mnext(vm * 5120 * 2);
+                let o_mh = mnext(vm * 2560 * 2);
+                let o_mhn = mnext(vm * 2560 * 2);
+                let o_mtid = mnext(vm * 8);
                 let o_mpos = mnext(4);
                 let o_mout = mnext(8);
 
@@ -839,26 +1767,26 @@ impl RustSplitEngine {
                 for l in &weights.p1_layers {
                     if l.is_linear {
                         p1_rb_off.push((
-                            mnext(32 * 128 * 128 * 4),
+                            if alloc_mtp_rec_final { Some(mnext(32 * 128 * 128 * 4)) } else { None },
                             mnext(vm * 8192 * 4 * 2),
                             mnext(vm * 8192 * 2),
                             mnext(vm * 32 * 2 * 4),
                         ));
                     } else {
-                        p1_rb_off.push((0, 0, 0, 0));
+                        p1_rb_off.push((None, 0, 0, 0));
                     }
                 }
                 let mut p2_rb_off = Vec::with_capacity(weights.p2_layers.len());
                 for l in &weights.p2_layers {
                     if l.is_linear {
                         p2_rb_off.push((
-                            mnext(32 * 128 * 128 * 4),
+                            if alloc_mtp_rec_final { Some(mnext(32 * 128 * 128 * 4)) } else { None },
                             mnext(vm * 8192 * 4 * 2),
                             mnext(vm * 8192 * 2),
                             mnext(vm * 32 * 2 * 4),
                         ));
                     } else {
-                        p2_rb_off.push((0, 0, 0, 0));
+                        p2_rb_off.push((None, 0, 0, 0));
                     }
                 }
 
@@ -869,7 +1797,7 @@ impl RustSplitEngine {
                 let p1_rb = weights.p1_layers.iter().zip(p1_rb_off.iter()).map(|(l, &(a, b, c, d))| {
                     if l.is_linear {
                         LinearRollbackPtrs {
-                            rec_final: arena + a,
+                            rec_final: a.map(|o| arena + o).unwrap_or(0),
                             conv_snaps: arena + b,
                             saved_qkv: arena + c,
                             saved_bg: arena + d,
@@ -881,7 +1809,7 @@ impl RustSplitEngine {
                 let p2_rb = weights.p2_layers.iter().zip(p2_rb_off.iter()).map(|(l, &(a, b, c, d))| {
                     if l.is_linear {
                         LinearRollbackPtrs {
-                            rec_final: arena + a,
+                            rec_final: a.map(|o| arena + o).unwrap_or(0),
                             conv_snaps: arena + b,
                             saved_qkv: arena + c,
                             saved_bg: arena + d,
@@ -891,8 +1819,8 @@ impl RustSplitEngine {
                     }
                 }).collect();
 
-                let h_verify_toks = cuda.alloc_pinned(4 * 8)? as *mut i64;
-                let h_draft_toks = cuda.alloc_pinned(4 * 8)? as *mut i64;
+                let h_verify_toks = cuda.alloc_pinned(vm * 8)? as *mut i64;
+                let h_draft_toks = cuda.alloc_pinned(vm * 8)? as *mut i64;
                 let h_mtp_tok = cuda.alloc_pinned(8)? as *mut i64;
 
                 Some(MtpRuntime {
@@ -919,7 +1847,6 @@ impl RustSplitEngine {
                     v_flash_ml: arena + o_vfm,
                     v_mlp_gu: arena + o_vgu,
                     v_mlp_act: arena + o_vac,
-                    v_logits: arena + o_vlg,
                     v_arg_vals: arena + o_vav,
                     v_arg_idxs: arena + o_vai,
                     mtp_cat: arena + o_mcat,
@@ -952,6 +1879,10 @@ impl RustSplitEngine {
         } else {
             None
         };
+
+        // Pre-allocate compact Prefill Workspace + ONE shared 90.0 MiB BF12->BF16 unpack buffer (net VRAM saved: -1,969 MiB!)
+        let (pf_arena, pf_bytes, pf_ws) = PrefillWorkspace::alloc_sized(&cuda, false)?;
+        let w_unpack_buf = cuda.alloc(W_UNPACK_BYTES)?;
 
         let mut eng = Self {
             cuda,
@@ -989,13 +1920,16 @@ impl RustSplitEngine {
             s_arg_vals: scratch_arena + o_av,
             s_arg_idxs: scratch_arena + o_ai,
             s_live_last_h: scratch_arena + o_lh,
-            pf_arena: 0,
-            pf_cap_seq: 0,
+            pf_arena,
+            pf_bytes,
+            pf_ws,
+            w_unpack_buf,
             h_tok_slots: [h0, h1],
             ev_slots: [ev0, ev1],
             decode_graph: std::ptr::null_mut(),
             mtp: mtp_rt,
             skinny_m4_wide,
+            prefill_int8,
             live_tokens: Vec::new(),
             live_has_mtp: false,
             prefix_cache_max_slots: prefix_cache_slots,
@@ -1006,9 +1940,6 @@ impl RustSplitEngine {
             prefix_cache_hits: 0,
             prefix_cache_saved_tokens: 0,
         };
-
-        // Pre-allocate chunked prefill workspace (513 rows = 46.6 MiB) upfront so steady-state VRAM never spikes mid-chat!
-        let _ = eng.ensure_prefill_workspace(513)?;
 
         eng.capture_decode_graph()?;
         if eng.mtp.is_some() {
@@ -1058,6 +1989,8 @@ impl RustSplitEngine {
             + self.p1_cache.bytes
             + self.p2_cache.bytes
             + self.scratch_bytes
+            + self.pf_bytes
+            + W_UNPACK_BYTES
             + (self.max_seq * 64 * 4)
             + mtp_b;
         total as f64 / (1024.0 * 1024.0)
@@ -1067,47 +2000,57 @@ impl RustSplitEngine {
         self.prefix_cache.len()
     }
 
-    /// Phase R6.1: Dispatch 8-warp Coalesced Skinny BF16 GEMM (M=1..4) with optional Fused Residual Add.
-    /// If `skinny_m4_wide` is false, routes wide projections (`N > 2560`, `M >= 2`, `!add_res`) to cuBLAS Tensor Cores!
+    /// Phase R14: Dispatch 100% Bit-Exact BF12-Lossless Skinny GEMM (M=1..5) + Optional Fused Residual Add.
     fn launch_skinny_gemm(
         &self,
         m: usize,
-        n: usize,
-        k: usize,
+        _n: usize,
+        _k: usize,
         x: CUdeviceptr,
-        w: CUdeviceptr,
+        w: Bf12Ptr,
         y: CUdeviceptr,
         add_res: bool,
     ) -> Result<()> {
-        if m >= 2 && n > 2560 && !add_res && !self.skinny_m4_wide {
-            return self.cuda.gemm_bf16_nt(m, n, k, x, w, y);
-        }
-        let mut x_p = x;
-        let mut w_p = w;
-        let mut y_p = y;
-        let mut n_i: i32 = n as i32;
-        let mut k_i: i32 = k as i32;
-        let mut add_i: i32 = if add_res { 1 } else { 0 };
-        let (func, grid_x) = match m {
-            1 => (self.funcs.skinny_gemm_m1, ((n + 3) / 4) as u32),
-            2 => (self.funcs.skinny_gemm_m2, ((n + 7) / 8) as u32),
-            3 => (self.funcs.skinny_gemm_m3, ((n + 7) / 8) as u32),
-            4 => (self.funcs.skinny_gemm_m4, ((n + 7) / 8) as u32),
-            _ => unreachable!("launch_skinny_gemm supports M=1..4"),
-        };
-        self.cuda.launch(
-            func,
-            (grid_x, 1, 1),
-            (256, 1, 1),
-            &mut [
-                &mut x_p as *mut _ as *mut c_void,
-                &mut w_p as *mut _ as *mut c_void,
-                &mut y_p as *mut _ as *mut c_void,
-                &mut n_i as *mut _ as *mut c_void,
-                &mut k_i as *mut _ as *mut c_void,
-                &mut add_i as *mut _ as *mut c_void,
-            ],
+        launch_skinny_bf12(&self.cuda, &self.funcs.bf12, m, x, w, y, add_res)
+    }
+
+    /// Phase R14: Batched Fused BF12-Lossless lm_head + Online Argmax for M=1..5 (ZERO logits DRAM, ZERO cuBLAS!).
+    fn launch_lm_head_argmax(
+        &self,
+        m: usize,
+        x_normed: CUdeviceptr,
+        part_vals: CUdeviceptr,
+        part_idxs: CUdeviceptr,
+        out_ids: CUdeviceptr,
+    ) -> Result<()> {
+        launch_lm_head_bf12_argmax(
+            &self.cuda,
+            &self.funcs.bf12,
+            self.funcs.argmax_stage2,
+            self.funcs.argmax_batch_stage2,
+            m,
+            x_normed,
+            self.weights.lm_head_w,
+            part_vals,
+            part_idxs,
+            out_ids,
         )
+    }
+
+    /// Phase R14: BF12 GEMM helper for MTP prefill chunks (uses direct skinny BF12 for seq_len <= 5, else fast unpack + cuBLAS).
+    fn launch_bf12_gemm_prefill(
+        &self,
+        m: usize,
+        x: CUdeviceptr,
+        w: Bf12Ptr,
+        y: CUdeviceptr,
+    ) -> Result<()> {
+        if m <= 5 {
+            launch_skinny_bf12(&self.cuda, &self.funcs.bf12, m, x, w, y, false)
+        } else {
+            launch_bf12_unpack(&self.cuda, &self.funcs.r10, w, self.w_unpack_buf)?;
+            self.cuda.gemm_bf16_nt(m, w.rows, w.cols, x, self.w_unpack_buf, y)
+        }
     }
 
     fn run_stage_decode_ops(
@@ -1286,24 +2229,11 @@ impl RustSplitEngine {
     fn decode_body(&self) -> Result<()> {
         let mut dim: i32 = 2560;
         let mut eps: f32 = self.cfg.rms_norm_eps;
-        let mut vocab_i: i32 = self.cfg.vocab_size as i32;
-        let mut nblk: i32 = 256;
 
         // ---- PART 1 (Stage 0) ----
         let mut tid_p = self.s_token_id;
-        let mut emb_p = self.weights.embed_w;
         let mut hid_p = self.s_hidden;
-        self.cuda.launch(
-            self.funcs.embed_single,
-            (10, 1, 1),
-            (256, 1, 1),
-            &mut [
-                &mut tid_p as *mut _ as *mut c_void,
-                &mut emb_p as *mut _ as *mut c_void,
-                &mut hid_p as *mut _ as *mut c_void,
-                &mut dim as *mut _ as *mut c_void,
-            ],
-        )?;
+        launch_embed_single_bf12(&self.cuda, &self.funcs.bf12, self.s_token_id, self.weights.embed_w, self.s_hidden)?;
         self.run_stage_decode_ops(&self.weights.p1_layers, &self.p1_cache.layers, self.s_hidden)?;
 
         // ---- ZERO-COPY GPU INTER-STAGE BRIDGE (Part 1 -> Part 2) ----
@@ -1336,35 +2266,8 @@ impl RustSplitEngine {
                 &mut eps as *mut _ as *mut c_void,
             ],
         )?;
-        self.cuda.gemm_bf16_nt(2, self.cfg.vocab_size, 2560, self.s_normed, self.weights.lm_head_w, self.s_logits)?;
-
-        // 2-Stage GPU Argmax + Auto-feedback s_next_token_id -> s_token_id + inc_pos
-        let mut lg_p = self.s_logits;
-        let mut av_p = self.s_arg_vals;
-        let mut ai_p = self.s_arg_idxs;
-        self.cuda.launch(
-            self.funcs.argmax_stage1,
-            (256, 1, 1),
-            (256, 1, 1),
-            &mut [
-                &mut lg_p as *mut _ as *mut c_void,
-                &mut av_p as *mut _ as *mut c_void,
-                &mut ai_p as *mut _ as *mut c_void,
-                &mut vocab_i as *mut _ as *mut c_void,
-            ],
-        )?;
+        self.launch_lm_head_argmax(1, self.s_normed, self.s_arg_vals, self.s_arg_idxs, self.s_next_token_id)?;
         let mut ntok_p = self.s_next_token_id;
-        self.cuda.launch(
-            self.funcs.argmax_stage2,
-            (1, 1, 1),
-            (256, 1, 1),
-            &mut [
-                &mut av_p as *mut _ as *mut c_void,
-                &mut ai_p as *mut _ as *mut c_void,
-                &mut ntok_p as *mut _ as *mut c_void,
-                &mut nblk as *mut _ as *mut c_void,
-            ],
-        )?;
         self.cuda.launch(
             self.funcs.copy_i64,
             (1, 1, 1),
@@ -1598,29 +2501,13 @@ impl RustSplitEngine {
 
     fn verify_body(&self, mtp: &MtpRuntime) -> Result<()> {
         let m = mtp.verify_m;
-        let mut m_i: i32 = m as i32;
         let mut dim: i32 = 2560;
         let mut eps: f32 = self.cfg.rms_norm_eps;
-        let mut vocab_i: i32 = self.cfg.vocab_size as i32;
-        let mut nblk: i32 = 256;
         let mut total_h: i32 = (m * 2560) as i32;
 
         // PART 1 (Stage 0)
-        let mut tid_p = mtp.v_tok_ids;
-        let mut emb_p = self.weights.embed_w;
         let mut hid_p = mtp.v_hidden;
-        self.cuda.launch(
-            self.funcs.embed_prefill,
-            (10, m as u32, 1),
-            (256, 1, 1),
-            &mut [
-                &mut tid_p as *mut _ as *mut c_void,
-                &mut emb_p as *mut _ as *mut c_void,
-                &mut hid_p as *mut _ as *mut c_void,
-                &mut m_i as *mut _ as *mut c_void,
-                &mut dim as *mut _ as *mut c_void,
-            ],
-        )?;
+        launch_embed_prefill_bf12(&self.cuda, &self.funcs.bf12, mtp.v_tok_ids, self.weights.embed_w, mtp.v_hidden, m)?;
         self.run_stage_verify_ops(mtp, &self.weights.p1_layers, &self.p1_cache.layers, &mtp.p1_rb, mtp.v_hidden)?;
 
         // ZERO-COPY GPU INTER-STAGE BRIDGE (Part 1 -> Part 2)
@@ -1655,35 +2542,8 @@ impl RustSplitEngine {
                 &mut eps as *mut _ as *mut c_void,
             ],
         )?;
-        self.cuda.gemm_bf16_nt(m, self.cfg.vocab_size, 2560, mtp.v_normed, self.weights.lm_head_w, mtp.v_logits)?;
-
-        // Batch Argmax across all M verified rows
-        let mut lg_p = mtp.v_logits;
-        let mut av_p = mtp.v_arg_vals;
-        let mut ai_p = mtp.v_arg_idxs;
-        let mut out_p = mtp.v_out_toks;
-        self.cuda.launch(
-            self.funcs.argmax_batch_stage1,
-            (256, m as u32, 1),
-            (256, 1, 1),
-            &mut [
-                &mut lg_p as *mut _ as *mut c_void,
-                &mut av_p as *mut _ as *mut c_void,
-                &mut ai_p as *mut _ as *mut c_void,
-                &mut vocab_i as *mut _ as *mut c_void,
-            ],
-        )?;
-        self.cuda.launch(
-            self.funcs.argmax_batch_stage2,
-            (1, m as u32, 1),
-            (256, 1, 1),
-            &mut [
-                &mut av_p as *mut _ as *mut c_void,
-                &mut ai_p as *mut _ as *mut c_void,
-                &mut out_p as *mut _ as *mut c_void,
-                &mut nblk as *mut _ as *mut c_void,
-            ],
-        )?;
+        // Phase R14: Fused Batched BF12 lm_head + Online Argmax across all M verified rows (ZERO v_logits, ZERO cuBLAS!)
+        self.launch_lm_head_argmax(m, mtp.v_normed, mtp.v_arg_vals, mtp.v_arg_idxs, mtp.v_out_toks)?;
         Ok(())
     }
 
@@ -1715,11 +2575,11 @@ impl RustSplitEngine {
             let mtp = self.mtp.as_ref().unwrap();
             (mtp.verify_m, mtp.v_tok_ids, mtp.v_pos, mtp.mtp_tok_ids, mtp.mtp_pos, mtp.mtp_out_tok)
         };
-        let toks = [1i64; 4];
+        let toks = [1i64; 5];
         let one_tok: i64 = 1;
         let pos_init: i32 = 8;
-        self.cuda.htod_sync(v_tok_ids, toks.as_ptr() as *const u8, 4 * 8)?;
-        self.cuda.htod_sync(mtp_tok_ids, toks.as_ptr() as *const u8, 4 * 8)?;
+        self.cuda.htod_sync(v_tok_ids, toks.as_ptr() as *const u8, verify_m * 8)?;
+        self.cuda.htod_sync(mtp_tok_ids, toks.as_ptr() as *const u8, verify_m * 8)?;
         self.cuda.htod_sync(mtp_out_tok, &one_tok as *const i64 as *const u8, 8)?;
         self.cuda.htod_sync(v_pos, &pos_init as *const i32 as *const u8, 4)?;
         self.cuda.htod_sync(mtp_pos, &pos_init as *const i32 as *const u8, 4)?;
@@ -1784,7 +2644,7 @@ impl RustSplitEngine {
                 }
                 let snap_ptr = rb.conv_snaps + (accepted * conv_bytes) as u64;
                 self.cuda.dtod_async(lc.conv_state, snap_ptr, conv_bytes)?;
-                if full_accept {
+                if full_accept && rb.rec_final != 0 {
                     self.cuda.dtod_async(lc.rec_state, rb.rec_final, rec_bytes)?;
                 } else {
                     let mut qkv = rb.saved_qkv;
@@ -1826,30 +2686,19 @@ impl RustSplitEngine {
         let mut n_splits: i32 = 4;
         let mut inter: i32 = 9216;
         let mut m_i: i32 = m as i32;
-        let mut vocab_i: i32 = self.cfg.vocab_size as i32;
-        let mut nblk: i32 = 256;
 
-        // 1. Fused embed(tok_ids) + pre_fc_norm_emb + pre_fc_norm_hid + concat -> mtp_cat [m, 5120]
-        let mut tid_p = tok_ids_gpu;
-        let mut emb_p = self.weights.embed_w;
-        let mut hin_p = hid_gpu;
-        let mut w_en = mw.pre_fc_norm_emb;
-        let mut w_hn = mw.pre_fc_norm_hid;
-        let mut cat_p = mtp.mtp_cat;
-        self.cuda.launch(
-            self.funcs.mtp_pre_fc_concat,
-            (m as u32, 1, 1),
-            (256, 1, 1),
-            &mut [
-                &mut tid_p as *mut _ as *mut c_void,
-                &mut emb_p as *mut _ as *mut c_void,
-                &mut hin_p as *mut _ as *mut c_void,
-                &mut w_en as *mut _ as *mut c_void,
-                &mut w_hn as *mut _ as *mut c_void,
-                &mut cat_p as *mut _ as *mut c_void,
-                &mut dim as *mut _ as *mut c_void,
-                &mut eps as *mut _ as *mut c_void,
-            ],
+        // 1. Fused embed(BF12) + pre_fc_norm_emb + pre_fc_norm_hid + concat -> mtp_cat [m, 5120]
+        launch_mtp_pre_fc_concat_bf12(
+            &self.cuda,
+            &self.funcs.bf12,
+            tok_ids_gpu,
+            self.weights.embed_w,
+            hid_gpu,
+            mw.pre_fc_norm_emb,
+            mw.pre_fc_norm_hid,
+            mtp.mtp_cat,
+            m,
+            eps,
         )?;
 
         // 2. mtp.fc: [m, 5120] -> mtp_h [m, 2560] (Phase R6: Custom Skinny BF16 GEMM, no M=1->2 padding!)
@@ -1982,34 +2831,7 @@ impl RustSplitEngine {
                 &mut eps as *mut _ as *mut c_void,
             ],
         )?;
-        self.cuda.gemm_bf16_nt(2, self.cfg.vocab_size, 2560, mtp.mtp_h_norm, self.weights.lm_head_w, mtp.v_logits)?;
-
-        let mut lg_p = mtp.v_logits;
-        let mut av_p = mtp.v_arg_vals;
-        let mut ai_p = mtp.v_arg_idxs;
-        let mut mout = mtp.mtp_out_tok;
-        self.cuda.launch(
-            self.funcs.argmax_stage1,
-            (256, 1, 1),
-            (256, 1, 1),
-            &mut [
-                &mut lg_p as *mut _ as *mut c_void,
-                &mut av_p as *mut _ as *mut c_void,
-                &mut ai_p as *mut _ as *mut c_void,
-                &mut vocab_i as *mut _ as *mut c_void,
-            ],
-        )?;
-        self.cuda.launch(
-            self.funcs.argmax_stage2,
-            (1, 1, 1),
-            (256, 1, 1),
-            &mut [
-                &mut av_p as *mut _ as *mut c_void,
-                &mut ai_p as *mut _ as *mut c_void,
-                &mut mout as *mut _ as *mut c_void,
-                &mut nblk as *mut _ as *mut c_void,
-            ],
-        )?;
+        self.launch_lm_head_argmax(1, mtp.mtp_h_norm, mtp.v_arg_vals, mtp.v_arg_idxs, mtp.mtp_out_tok)?;
         Ok(())
     }
 
@@ -2028,7 +2850,43 @@ impl RustSplitEngine {
 
     /// Prefill 1-layer MTP on `seq_len` positions starting at `start_pos` using post-norm `h_norm [seq_len, 2560]`
     /// and `shifted_ids [seq_len]` -> populates MTP KV cache & optionally returns draft token from last row!
+    /// Phase R11: automatically sub-chunks `seq_len > 512` into <= 512-token slices (zero aliasing via `p_mtp_h_copy`)!
     fn run_mtp_prefill_range(
+        &mut self,
+        start_pos: usize,
+        shifted_ids: &[i64],
+        h_norm_gpu: CUdeviceptr,
+        predict_draft: bool,
+    ) -> Result<i64> {
+        let total_len = shifted_ids.len();
+        if total_len == 0 {
+            return Ok(0);
+        }
+        let ws = self.pf_ws;
+        if total_len > 512 {
+            // Copy full h_norm_gpu [total_len, 2560] (<= 5 MiB) into safe tail slot p_mtp_h_copy before chunking!
+            let h_copy = ws.p_mtp_h_copy();
+            self.cuda.dtod_async(h_copy, h_norm_gpu, total_len * 2560 * 2)?;
+            let mut off = 0usize;
+            let mut last_draft = 0i64;
+            while off < total_len {
+                let sub_len = (total_len - off).min(512);
+                let is_last = off + sub_len == total_len;
+                let sub_h = h_copy + (off * 2560 * 2) as u64;
+                last_draft = self.run_mtp_prefill_chunk(
+                    start_pos + off,
+                    &shifted_ids[off..off + sub_len],
+                    sub_h,
+                    predict_draft && is_last,
+                )?;
+                off += sub_len;
+            }
+            return Ok(last_draft);
+        }
+        self.run_mtp_prefill_chunk(start_pos, shifted_ids, h_norm_gpu, predict_draft)
+    }
+
+    fn run_mtp_prefill_chunk(
         &mut self,
         start_pos: usize,
         shifted_ids: &[i64],
@@ -2039,7 +2897,10 @@ impl RustSplitEngine {
         if seq_len == 0 {
             return Ok(0);
         }
-        let (p_ids, p_h, p_nrm, p_del, p_co, _p_dn_raw, p_big, p_med) = self.ensure_prefill_workspace(seq_len)?;
+        let ws = self.pf_ws;
+        let (p_ids, p_h, p_nrm, p_del, p_co, p_big, p_med) = (
+            ws.p_ids, ws.p_h, ws.p_nrm, ws.p_del, ws.p_co_512(), ws.p_big_512(), ws.p_med_512(),
+        );
         // Note: h_norm_gpu might alias p_nrm! Copy shifted_ids -> p_ids, concat -> p_big [seq_len, 5120],
         // fc -> p_h [seq_len, 2560] (doesn't overwrite p_nrm until after concat!).
         self.cuda.htod_sync(p_ids, shifted_ids.as_ptr() as *const u8, seq_len * 8)?;
@@ -2055,31 +2916,22 @@ impl RustSplitEngine {
         let mut inter: i32 = 9216;
         let mut total_h: i32 = (seq_len * 2560) as i32;
 
-        // 1. Fused embed + pre_fc_norm_emb + pre_fc_norm_hid + concat -> p_big [seq_len, 5120]
-        let mut tid_p = p_ids;
-        let mut emb_p = self.weights.embed_w;
-        let mut hin_p = h_norm_gpu;
-        let mut w_en = mw.pre_fc_norm_emb;
-        let mut w_hn = mw.pre_fc_norm_hid;
-        let mut cat_p = p_big;
-        self.cuda.launch(
-            self.funcs.mtp_pre_fc_concat,
-            (seq_len as u32, 1, 1),
-            (256, 1, 1),
-            &mut [
-                &mut tid_p as *mut _ as *mut c_void,
-                &mut emb_p as *mut _ as *mut c_void,
-                &mut hin_p as *mut _ as *mut c_void,
-                &mut w_en as *mut _ as *mut c_void,
-                &mut w_hn as *mut _ as *mut c_void,
-                &mut cat_p as *mut _ as *mut c_void,
-                &mut dim as *mut _ as *mut c_void,
-                &mut eps as *mut _ as *mut c_void,
-            ],
+        // 1. Fused embed(BF12) + pre_fc_norm_emb + pre_fc_norm_hid + concat -> p_big [seq_len, 5120]
+        launch_mtp_pre_fc_concat_bf12(
+            &self.cuda,
+            &self.funcs.bf12,
+            p_ids,
+            self.weights.embed_w,
+            h_norm_gpu,
+            mw.pre_fc_norm_emb,
+            mw.pre_fc_norm_hid,
+            p_big,
+            seq_len,
+            eps,
         )?;
 
         // 2. mtp.fc: [seq_len, 5120] -> p_h [seq_len, 2560]
-        self.cuda.gemm_bf16_nt(seq_len.max(2), 2560, 5120, p_big, mw.fc_w, p_h)?;
+        self.launch_bf12_gemm_prefill(seq_len, p_big, mw.fc_w, p_h)?;
 
         // 3. mtp.layers.0 (Full Attention + MLP)
         let mut h_p = p_h;
@@ -2098,7 +2950,7 @@ impl RustSplitEngine {
             ],
         )?;
 
-        self.cuda.gemm_bf16_nt(seq_len.max(2), 10240, 2560, p_nrm, lyr.qkv, p_big)?;
+        self.launch_bf12_gemm_prefill(seq_len, p_nrm, lyr.qkv, p_big)?;
         let mut qkv_p = p_big;
         let mut qnw = lyr.q_norm;
         let mut knw = lyr.k_norm;
@@ -2127,23 +2979,42 @@ impl RustSplitEngine {
             ],
         )?;
         let mut co = p_co;
-        let q_tiles = ((seq_len + 1) / 2) as u32;
-        self.cuda.launch(
-            self.funcs.prefill_gqa_causal_gated,
-            (4, q_tiles, 1),
-            (256, 1, 1),
-            &mut [
-                &mut q_sdpa as *mut _ as *mut c_void,
-                &mut qkv_p as *mut _ as *mut c_void,
-                &mut kc as *mut _ as *mut c_void,
-                &mut vc as *mut _ as *mut c_void,
-                &mut start_i as *mut _ as *mut c_void,
-                &mut seq_i as *mut _ as *mut c_void,
-                &mut max_seq_i as *mut _ as *mut c_void,
-                &mut co as *mut _ as *mut c_void,
-            ],
-        )?;
-        self.cuda.gemm_bf16_nt(seq_len.max(2), 2560, 4096, p_co, lyr.o_proj, p_del)?;
+        if seq_len >= 64 {
+            let q_tiles = ((seq_len + 31) / 32) as u32;
+            self.cuda.launch(
+                self.funcs.prefill_gqa_wmma_32x16,
+                (16, q_tiles, 1),
+                (128, 1, 1),
+                &mut [
+                    &mut q_sdpa as *mut _ as *mut c_void,
+                    &mut qkv_p as *mut _ as *mut c_void,
+                    &mut kc as *mut _ as *mut c_void,
+                    &mut vc as *mut _ as *mut c_void,
+                    &mut start_i as *mut _ as *mut c_void,
+                    &mut seq_i as *mut _ as *mut c_void,
+                    &mut max_seq_i as *mut _ as *mut c_void,
+                    &mut co as *mut _ as *mut c_void,
+                ],
+            )?;
+        } else {
+            let q_tiles = ((seq_len + 1) / 2) as u32;
+            self.cuda.launch(
+                self.funcs.prefill_gqa_causal_gated,
+                (4, q_tiles, 1),
+                (256, 1, 1),
+                &mut [
+                    &mut q_sdpa as *mut _ as *mut c_void,
+                    &mut qkv_p as *mut _ as *mut c_void,
+                    &mut kc as *mut _ as *mut c_void,
+                    &mut vc as *mut _ as *mut c_void,
+                    &mut start_i as *mut _ as *mut c_void,
+                    &mut seq_i as *mut _ as *mut c_void,
+                    &mut max_seq_i as *mut _ as *mut c_void,
+                    &mut co as *mut _ as *mut c_void,
+                ],
+            )?;
+        }
+        self.launch_bf12_gemm_prefill(seq_len, p_co, lyr.o_proj, p_del)?;
 
         let mut del_p = p_del;
         let mut pnw = lyr.post_norm;
@@ -2161,7 +3032,7 @@ impl RustSplitEngine {
             ],
         )?;
 
-        self.cuda.gemm_bf16_nt(seq_len.max(2), 18432, 2560, p_nrm, lyr.gate_up, p_big)?;
+        self.launch_bf12_gemm_prefill(seq_len, p_nrm, lyr.gate_up, p_big)?;
         let mut gu_p = p_big;
         let mut act_p = p_med;
         self.cuda.launch(
@@ -2175,7 +3046,7 @@ impl RustSplitEngine {
                 &mut seq_i as *mut _ as *mut c_void,
             ],
         )?;
-        self.cuda.gemm_bf16_nt(seq_len.max(2), 2560, 9216, p_med, lyr.down, p_del)?;
+        self.launch_bf12_gemm_prefill(seq_len, p_med, lyr.down, p_del)?;
 
         let blocks = ((seq_len * 2560 + 255) / 256) as u32;
         self.cuda.launch(
@@ -2193,12 +3064,10 @@ impl RustSplitEngine {
             return Ok(0);
         }
 
-        // Last row -> mtp.norm -> mtp.mtp_h_norm -> lm_head -> argmax -> draft_1!
+        // Last row -> mtp.norm -> mtp.mtp_h_norm -> Fused lm_head_bf12_argmax -> draft_1!
         let mut last_h = p_h + ((seq_len - 1) * 2560 * 2) as u64;
         let mut mnw = mw.norm_w;
         let mut hnorm = mtp.mtp_h_norm;
-        let mut vocab_i: i32 = self.cfg.vocab_size as i32;
-        let mut nblk: i32 = 256;
         self.cuda.launch(
             self.funcs.rmsnorm_2d,
             (1, 1, 1),
@@ -2211,38 +3080,11 @@ impl RustSplitEngine {
                 &mut eps as *mut _ as *mut c_void,
             ],
         )?;
-        self.cuda.gemm_bf16_nt(2, self.cfg.vocab_size, 2560, mtp.mtp_h_norm, self.weights.lm_head_w, mtp.v_logits)?;
-        let mut lg_p = mtp.v_logits;
-        let mut av_p = mtp.v_arg_vals;
-        let mut ai_p = mtp.v_arg_idxs;
-        let mut mout = mtp.mtp_out_tok;
-        self.cuda.launch(
-            self.funcs.argmax_stage1,
-            (256, 1, 1),
-            (256, 1, 1),
-            &mut [
-                &mut lg_p as *mut _ as *mut c_void,
-                &mut av_p as *mut _ as *mut c_void,
-                &mut ai_p as *mut _ as *mut c_void,
-                &mut vocab_i as *mut _ as *mut c_void,
-            ],
-        )?;
-        self.cuda.launch(
-            self.funcs.argmax_stage2,
-            (1, 1, 1),
-            (256, 1, 1),
-            &mut [
-                &mut av_p as *mut _ as *mut c_void,
-                &mut ai_p as *mut _ as *mut c_void,
-                &mut mout as *mut _ as *mut c_void,
-                &mut nblk as *mut _ as *mut c_void,
-            ],
-        )?;
+        self.launch_lm_head_argmax(1, mtp.mtp_h_norm, mtp.v_arg_vals, mtp.v_arg_idxs, mtp.mtp_out_tok)?;
         Ok(0)
     }
 
-    /// Phase R7.1: Full-Cycle CUDA Graph Launch for MTP Draft Chain (d2..dK) + Parallel Verify M=4!
-    /// Replaces ~45 eager launches + verify_graph with ONE SINGLE CUDA GRAPH LAUNCH (`draft_and_verify_graph`)!
+    /// Phase R7.1 + R13: Full-Cycle CUDA Graph Launch for MTP Draft Chain (d2..dK) + Parallel Verify M=K+1!
     fn enqueue_mtp_draft_and_verify(&self, cur_tok: i64, cur_pos: usize) -> Result<()> {
         let mtp = self.mtp.as_ref().unwrap();
         let pos_i32 = cur_pos as i32;
@@ -2253,12 +3095,11 @@ impl RustSplitEngine {
         Ok(())
     }
 
-    /// Phase R7.1: Full-Cycle CUDA Graph Launch for Commit DeltaNet + MTP d1 + d2..dK + Next Verify M=4!
-    /// ONLY 2 CUDA GRAPH LAUNCHES for the ENTIRE MTP K=3 cycle (ZERO eager kernel launches)!
+    /// Phase R7.1 + R13: Full-Cycle CUDA Graph Launch for Commit DeltaNet + MTP d1 + d2..dK + Next Verify M=K+1!
     fn enqueue_mtp_commit_and_next_verify(
         &self,
         accepted: usize,
-        v_toks: &[i64; 4],
+        v_toks: &[i64; 5],
         cur_pos: usize,
     ) -> Result<()> {
         let mtp = self.mtp.as_ref().unwrap();
@@ -2484,67 +3325,26 @@ impl RustSplitEngine {
         }
     }
 
-    fn ensure_prefill_workspace(&mut self, seq_len: usize) -> Result<(CUdeviceptr, CUdeviceptr, CUdeviceptr, CUdeviceptr, CUdeviceptr, CUdeviceptr, CUdeviceptr, CUdeviceptr)> {
-        // Keep pf_arena compact (<= ~47 MiB at chunk=512) so --max-seq 4096 never blows RTX 3080 10 GB VRAM!
-        let cap = if seq_len <= 128 {
-            128
-        } else if seq_len <= 256 {
-            256
-        } else if seq_len <= 512 {
-            512
-        } else {
-            seq_len.min(self.max_seq)
-        };
-        if cap > self.pf_cap_seq {
-            if self.pf_arena != 0 {
-                self.cuda.free(self.pf_arena);
-            }
-            let align = |b: usize| (b + 255) & !255;
-            let bytes = align(cap * 8)
-                + align(cap * 2560 * 2) * 3
-                + align(cap * 4096 * 2)
-                + align(cap * 4096 * 4)
-                + align(cap * 18432 * 2)
-                + align(cap * 9216 * 2);
-            self.pf_arena = self.cuda.alloc(bytes)?;
-            self.pf_cap_seq = cap;
-        }
-        let align = |b: usize| (b + 255) & !255;
-        let c = self.pf_cap_seq;
-        let mut off = 0u64;
-        let mut take = |b: usize| {
-            let p = self.pf_arena + off;
-            off += align(b) as u64;
-            p
-        };
-        let p_ids = take(c * 8);
-        let p_h = take(c * 2560 * 2);
-        let p_nrm = take(c * 2560 * 2);
-        let p_del = take(c * 2560 * 2);
-        let p_co = take(c * 4096 * 2);
-        let p_dn_raw = take(c * 4096 * 4);
-        let p_big = take(c * 18432 * 2);
-        let p_med = take(c * 9216 * 2);
-        Ok((p_ids, p_h, p_nrm, p_del, p_co, p_dn_raw, p_big, p_med))
-    }
-
     fn run_stage_prefill_ops(
         &self,
         layers: &[PackedLayerPtrs],
         caches: &[LayerCachePtrs],
         rbs: Option<&[LinearRollbackPtrs]>,
-        h: CUdeviceptr,
-        normed: CUdeviceptr,
-        delta: CUdeviceptr,
-        core_out: CUdeviceptr,
-        dn_raw: CUdeviceptr,
-        ws_big: CUdeviceptr,
-        ws_med: CUdeviceptr,
         start_pos: usize,
         seq_len: usize,
         use_init_state: i32,
         snap_t: i32,
     ) -> Result<()> {
+        let ws = self.pf_ws;
+        let h = ws.p_h;
+        let normed = ws.p_nrm;
+        let delta = ws.p_del;
+        let hdr_b = ws.header_row_bytes();
+        let is_1024 = ws.is_1024();
+        let max_m_cap = if is_1024 { 1024usize } else { 512usize };
+        let align256 = |b: usize| (b + 255) & !255;
+        let m_pad = (seq_len + 3) & !3;
+
         let mut dim: i32 = 2560;
         let mut eps: f32 = self.cfg.rms_norm_eps;
         let mut seq_i: i32 = seq_len as i32;
@@ -2553,9 +3353,6 @@ impl RustSplitEngine {
         let mut c8192: i32 = 8192;
         let mut stride_dn: i32 = 12352;
         let mut inter: i32 = 9216;
-        let mut total_h: i32 = (seq_len * 2560) as i32;
-        let mut use_init = use_init_state;
-        let mut snap_i = snap_t;
 
         for (idx, (lyr, lc)) in layers.iter().zip(caches.iter()).enumerate() {
             let mut h_p = h;
@@ -2575,133 +3372,195 @@ impl RustSplitEngine {
             )?;
 
             if lyr.is_linear {
-                self.cuda.gemm_bf16_nt(seq_len, 12352, 2560, normed, lyr.in_all, ws_big)?;
-                let mut pin = ws_big;
-                let mut cs = lc.conv_state;
-                let mut cs_snap = rbs.map(|r| r[idx].conv_snaps).unwrap_or(0);
-                let mut cw = lyr.conv_w;
-                let mut cv_out = ws_med;
-                if seq_len >= 64 {
-                    let t_tiles = ((seq_len + 31) / 32) as u32;
-                    self.cuda.launch(
-                        self.funcs.conv1d_prefill_2d,
-                        (32, t_tiles, 1),
-                        (256, 1, 1),
-                        &mut [
-                            &mut pin as *mut _ as *mut c_void,
-                            &mut cs as *mut _ as *mut c_void,
-                            &mut cs_snap as *mut _ as *mut c_void,
-                            &mut cw as *mut _ as *mut c_void,
-                            &mut cv_out as *mut _ as *mut c_void,
-                            &mut seq_i as *mut _ as *mut c_void,
-                            &mut c8192 as *mut _ as *mut c_void,
-                            &mut stride_dn as *mut _ as *mut c_void,
-                            &mut use_init as *mut _ as *mut c_void,
-                            &mut snap_i as *mut _ as *mut c_void,
-                        ],
-                    )?;
-                    self.cuda.launch(
-                        self.funcs.conv1d_update_state,
-                        (32, 1, 1),
-                        (256, 1, 1),
-                        &mut [
-                            &mut pin as *mut _ as *mut c_void,
-                            &mut cs as *mut _ as *mut c_void,
-                            &mut seq_i as *mut _ as *mut c_void,
-                            &mut c8192 as *mut _ as *mut c_void,
-                            &mut stride_dn as *mut _ as *mut c_void,
-                            &mut use_init as *mut _ as *mut c_void,
-                        ],
-                    )?;
+                let p_in_all = ws.p_pool;
+                let in_all_b = align256(m_pad * 12352 * 2);
+                run_prefill_gemm_i8(
+                    &self.cuda, &self.funcs.r10, self.funcs.residual_add,
+                    self.prefill_int8, seq_len, 12352, 2560, max_m_cap,
+                    normed, lyr.in_all, self.w_unpack_buf, p_in_all, 0, false,
+                    delta, hdr_b, ws.p_pool + in_all_b as u64, ws.pool_bytes - in_all_b,
+                )?;
+
+                let (p_core_out, p_wy_dn_raw, conv_out_buf, wy_tail_buf, out_bc_bytes) = if is_1024 {
+                    (
+                        ws.p_pool + 25_427_968,  // +24.25 MiB (8.00 MiB)
+                        ws.p_pool + 33_816_576,  // +32.25 MiB (8.00 MiB)
+                        delta,                   // 5.02 MiB >= 4.00 MiB
+                        normed,                  // 5.02 MiB >= 4.07 MiB
+                        25_427_968usize,
+                    )
                 } else {
-                    self.cuda.launch(
-                        self.funcs.conv1d_prefill,
-                        (32, 1, 1),
-                        (256, 1, 1),
-                        &mut [
-                            &mut pin as *mut _ as *mut c_void,
-                            &mut cs as *mut _ as *mut c_void,
-                            &mut cs_snap as *mut _ as *mut c_void,
-                            &mut cw as *mut _ as *mut c_void,
-                            &mut cv_out as *mut _ as *mut c_void,
-                            &mut seq_i as *mut _ as *mut c_void,
-                            &mut c8192 as *mut _ as *mut c_void,
-                            &mut stride_dn as *mut _ as *mut c_void,
-                            &mut use_init as *mut _ as *mut c_void,
-                            &mut snap_i as *mut _ as *mut c_void,
-                        ],
-                    )?;
+                    (
+                        ws.p_pool + 12_845_056,  // +12.25 MiB (4.00 MiB)
+                        ws.p_pool + 17_039_360,  // +16.25 MiB (8.00 MiB)
+                        ws.p_pool + 25_427_968,  // +24.25 MiB (4.00 MiB)
+                        ws.p_pool + 29_622_272,  // +28.25 MiB (4.75 MiB >= 4.07 MiB, ends 33.00 MiB!)
+                        12_845_056usize,         // 12.25 MiB >= 10.01 MiB -> 1-shot PTX-IMMA out_proj!
+                    )
+                };
+                let cs_snap_base = rbs.map(|r| r[idx].conv_snaps).unwrap_or(0);
+                let rec_snap_base = rbs.map(|r| r[idx].rec_final).unwrap_or(0);
+
+                // Stream Conv1D + WY in 256-token tiles
+                let mut sub_start = 0usize;
+                while sub_start < seq_len {
+                    let sub_len = (seq_len - sub_start).min(256);
+                    let mut sub_len_i: i32 = sub_len as i32;
+                    let mut sub_use_init: i32 = if use_init_state != 0 || sub_start > 0 { 1 } else { 0 };
+                    let mut sub_snap_i: i32 = if snap_t > 0
+                        && (snap_t as usize) > sub_start
+                        && (snap_t as usize) <= sub_start + sub_len
+                    {
+                        snap_t - sub_start as i32
+                    } else {
+                        0
+                    };
+                    let mut pin = p_in_all + (sub_start * 12352 * 2) as u64;
+                    let sub_co = p_core_out + (sub_start * 4096 * 2) as u64;
+                    let mut cs = lc.conv_state;
+                    let mut cs_snap = if sub_snap_i > 0 { cs_snap_base } else { 0 };
+                    let rec_snap = if sub_snap_i > 0 { rec_snap_base } else { 0 };
+                    let mut cw = lyr.conv_w;
+                    let mut cv_out = conv_out_buf;
+
+                    if sub_len >= 64 {
+                        let t_tiles = ((sub_len + 31) / 32) as u32;
+                        self.cuda.launch(
+                            self.funcs.conv1d_prefill_2d,
+                            (32, t_tiles, 1),
+                            (256, 1, 1),
+                            &mut [
+                                &mut pin as *mut _ as *mut c_void,
+                                &mut cs as *mut _ as *mut c_void,
+                                &mut cs_snap as *mut _ as *mut c_void,
+                                &mut cw as *mut _ as *mut c_void,
+                                &mut cv_out as *mut _ as *mut c_void,
+                                &mut sub_len_i as *mut _ as *mut c_void,
+                                &mut c8192 as *mut _ as *mut c_void,
+                                &mut stride_dn as *mut _ as *mut c_void,
+                                &mut sub_use_init as *mut _ as *mut c_void,
+                                &mut sub_snap_i as *mut _ as *mut c_void,
+                            ],
+                        )?;
+                        self.cuda.launch(
+                            self.funcs.conv1d_update_state,
+                            (32, 1, 1),
+                            (256, 1, 1),
+                            &mut [
+                                &mut pin as *mut _ as *mut c_void,
+                                &mut cs as *mut _ as *mut c_void,
+                                &mut sub_len_i as *mut _ as *mut c_void,
+                                &mut c8192 as *mut _ as *mut c_void,
+                                &mut stride_dn as *mut _ as *mut c_void,
+                                &mut sub_use_init as *mut _ as *mut c_void,
+                            ],
+                        )?;
+                    } else {
+                        self.cuda.launch(
+                            self.funcs.conv1d_prefill,
+                            (32, 1, 1),
+                            (256, 1, 1),
+                            &mut [
+                                &mut pin as *mut _ as *mut c_void,
+                                &mut cs as *mut _ as *mut c_void,
+                                &mut cs_snap as *mut _ as *mut c_void,
+                                &mut cw as *mut _ as *mut c_void,
+                                &mut cv_out as *mut _ as *mut c_void,
+                                &mut sub_len_i as *mut _ as *mut c_void,
+                                &mut c8192 as *mut _ as *mut c_void,
+                                &mut stride_dn as *mut _ as *mut c_void,
+                                &mut sub_use_init as *mut _ as *mut c_void,
+                                &mut sub_snap_i as *mut _ as *mut c_void,
+                            ],
+                        )?;
+                    }
+
+                    if sub_len >= 192 {
+                        run_deltanet_prefill_wy(
+                            &self.cuda,
+                            &self.funcs.wy,
+                            cv_out,
+                            pin,
+                            lyr.dt_bias,
+                            lyr.a_log_f32,
+                            lyr.dn_norm,
+                            lc.rec_state,
+                            rec_snap,
+                            p_wy_dn_raw,
+                            wy_tail_buf,
+                            sub_co,
+                            sub_len,
+                            sub_use_init,
+                            sub_snap_i,
+                            eps,
+                        )?;
+                    } else {
+                        let mut dtb = lyr.dt_bias;
+                        let mut alog = lyr.a_log_f32;
+                        let mut dnw = lyr.dn_norm;
+                        let mut rec = lc.rec_state;
+                        let mut rec_snap_p = rec_snap;
+                        let mut raw_p = p_wy_dn_raw;
+                        let mut co = sub_co;
+                        self.cuda.launch(
+                            self.funcs.deltanet_prefill,
+                            (32, 4, 1),
+                            (128, 1, 1),
+                            &mut [
+                                &mut cv_out as *mut _ as *mut c_void,
+                                &mut pin as *mut _ as *mut c_void,
+                                &mut dtb as *mut _ as *mut c_void,
+                                &mut alog as *mut _ as *mut c_void,
+                                &mut rec as *mut _ as *mut c_void,
+                                &mut rec_snap_p as *mut _ as *mut c_void,
+                                &mut raw_p as *mut _ as *mut c_void,
+                                &mut sub_len_i as *mut _ as *mut c_void,
+                                &mut sub_use_init as *mut _ as *mut c_void,
+                                &mut sub_snap_i as *mut _ as *mut c_void,
+                            ],
+                        )?;
+                        self.cuda.launch(
+                            self.funcs.deltanet_prefill_norm_gate,
+                            (32, sub_len as u32, 1),
+                            (128, 1, 1),
+                            &mut [
+                                &mut raw_p as *mut _ as *mut c_void,
+                                &mut pin as *mut _ as *mut c_void,
+                                &mut dnw as *mut _ as *mut c_void,
+                                &mut co as *mut _ as *mut c_void,
+                                &mut eps as *mut _ as *mut c_void,
+                            ],
+                        )?;
+                    }
+                    sub_start += sub_len;
                 }
 
-                let rec_snap = rbs.map(|r| r[idx].rec_final).unwrap_or(0);
-                // Hybrid crossover verified via nsys: sequential wins for T < 192 (1 launch),
-                // WMMA Chunked WY Tensor Core wins decisively for T >= 192 (1.80x faster at T=512!)
-                if seq_len >= 192 && seq_len <= 513 {
-                    run_deltanet_prefill_wy(
-                        &self.cuda,
-                        &self.funcs.wy,
-                        cv_out,
-                        pin,
-                        lyr.dt_bias,
-                        lyr.a_log_f32,
-                        lyr.dn_norm,
-                        lc.rec_state,
-                        rec_snap,
-                        dn_raw,
-                        ws_big,
-                        core_out,
-                        seq_len,
-                        use_init,
-                        snap_i,
-                        eps,
-                    )?;
-                } else {
-                    let mut dtb = lyr.dt_bias;
-                    let mut alog = lyr.a_log_f32;
-                    let mut dnw = lyr.dn_norm;
-                    let mut rec = lc.rec_state;
-                    let mut rec_snap_p = rec_snap;
-                    let mut raw_p = dn_raw;
-                    let mut co = core_out;
-                    self.cuda.launch(
-                        self.funcs.deltanet_prefill,
-                        (32, 4, 1),
-                        (128, 1, 1),
-                        &mut [
-                            &mut cv_out as *mut _ as *mut c_void,
-                            &mut pin as *mut _ as *mut c_void,
-                            &mut dtb as *mut _ as *mut c_void,
-                            &mut alog as *mut _ as *mut c_void,
-                            &mut rec as *mut _ as *mut c_void,
-                            &mut rec_snap_p as *mut _ as *mut c_void,
-                            &mut raw_p as *mut _ as *mut c_void,
-                            &mut seq_i as *mut _ as *mut c_void,
-                            &mut use_init as *mut _ as *mut c_void,
-                            &mut snap_i as *mut _ as *mut c_void,
-                        ],
-                    )?;
-                    self.cuda.launch(
-                        self.funcs.deltanet_prefill_norm_gate,
-                        (32, seq_len as u32, 1),
-                        (128, 1, 1),
-                        &mut [
-                            &mut raw_p as *mut _ as *mut c_void,
-                            &mut pin as *mut _ as *mut c_void,
-                            &mut dnw as *mut _ as *mut c_void,
-                            &mut co as *mut _ as *mut c_void,
-                            &mut eps as *mut _ as *mut c_void,
-                        ],
-                    )?;
-                }
-                self.cuda.gemm_bf16_nt(seq_len, 2560, 4096, core_out, lyr.out_proj, delta)?;
+                // 1-Shot out_proj across ALL seq_len tokens!
+                run_prefill_gemm_i8(
+                    &self.cuda, &self.funcs.r10, self.funcs.residual_add,
+                    self.prefill_int8, seq_len, 2560, 4096, max_m_cap,
+                    p_core_out, lyr.out_proj, self.w_unpack_buf, delta, 0, false,
+                    normed, hdr_b, ws.p_pool, out_bc_bytes,
+                )?;
             } else {
-                self.cuda.gemm_bf16_nt(seq_len, 10240, 2560, normed, lyr.qkv, ws_big)?;
-                let mut qkv_p = ws_big;
+                let p_qkv = ws.p_pool;
+                let qkv_b = align256(m_pad * 10240 * 2);
+                run_prefill_gemm_i8(
+                    &self.cuda, &self.funcs.r10, self.funcs.residual_add,
+                    self.prefill_int8, seq_len, 10240, 2560, max_m_cap,
+                    normed, lyr.qkv, self.w_unpack_buf, p_qkv, 0, false,
+                    delta, hdr_b, ws.p_pool + qkv_b as u64, ws.pool_bytes - qkv_b,
+                )?;
+                let mut qkv_p = p_qkv;
                 let mut qnw = lyr.q_norm;
                 let mut knw = lyr.k_norm;
                 let mut cos_p = self.cos_table;
                 let mut sin_p = self.sin_table;
-                let mut q_sdpa = ws_med;
+                let (mut q_sdpa, p_core_out, o_bc_bytes) = if is_1024 {
+                    (ws.p_pool + 20_971_520, ws.p_pool + 29_360_128, 29_360_128usize)
+                } else {
+                    (ws.p_pool + 10_485_760, ws.p_pool + 14_680_064, 14_680_064usize)
+                };
                 let mut kc = lc.k_cache;
                 let mut vc = lc.v_cache;
                 self.cuda.launch(
@@ -2723,11 +3582,11 @@ impl RustSplitEngine {
                         &mut eps as *mut _ as *mut c_void,
                     ],
                 )?;
-                let mut co = core_out;
+                let mut co = p_core_out;
                 if seq_len >= 64 {
-                    let q_tiles = ((seq_len + 15) / 16) as u32;
+                    let q_tiles = ((seq_len + 31) / 32) as u32;
                     self.cuda.launch(
-                        self.funcs.prefill_gqa_wmma,
+                        self.funcs.prefill_gqa_wmma_32x16,
                         (16, q_tiles, 1),
                         (128, 1, 1),
                         &mut [
@@ -2759,7 +3618,13 @@ impl RustSplitEngine {
                         ],
                     )?;
                 }
-                self.cuda.gemm_bf16_nt(seq_len, 2560, 4096, core_out, lyr.o_proj, delta)?;
+                // 1-Shot o_proj across ALL seq_len tokens!
+                run_prefill_gemm_i8(
+                    &self.cuda, &self.funcs.r10, self.funcs.residual_add,
+                    self.prefill_int8, seq_len, 2560, 4096, max_m_cap,
+                    p_core_out, lyr.o_proj, self.w_unpack_buf, delta, 0, false,
+                    normed, hdr_b, ws.p_pool, o_bc_bytes,
+                )?;
             }
 
             let mut del_p = delta;
@@ -2778,33 +3643,49 @@ impl RustSplitEngine {
                 ],
             )?;
 
-            self.cuda.gemm_bf16_nt(seq_len, 18432, 2560, normed, lyr.gate_up, ws_big)?;
-            let mut gu_p = ws_big;
-            let mut act_p = ws_med;
-            self.cuda.launch(
-                self.funcs.silu_mul_packed_2d,
-                (36, seq_len as u32, 1),
-                (256, 1, 1),
-                &mut [
-                    &mut gu_p as *mut _ as *mut c_void,
-                    &mut act_p as *mut _ as *mut c_void,
-                    &mut inter as *mut _ as *mut c_void,
-                    &mut seq_i as *mut _ as *mut c_void,
-                ],
-            )?;
-            self.cuda.gemm_bf16_nt(seq_len, 2560, 9216, ws_med, lyr.down, delta)?;
-
-            let blocks = ((seq_len * 2560 + 255) / 256) as u32;
-            self.cuda.launch(
-                self.funcs.residual_add,
-                (blocks, 1, 1),
-                (256, 1, 1),
-                &mut [
-                    &mut h_p as *mut _ as *mut c_void,
-                    &mut del_p as *mut _ as *mut c_void,
-                    &mut total_h as *mut _ as *mut c_void,
-                ],
-            )?;
+            if self.prefill_int8 == PrefillInt8Mode::Smooth && seq_len >= 64 && m_pad <= max_m_cap {
+                run_prefill_fused_tiled_mlp_i8(
+                    &self.cuda,
+                    &self.funcs.r10,
+                    seq_len,
+                    normed,
+                    lyr.gate_up,
+                    lyr.down,
+                    h,
+                    delta,
+                    ws.p_pool,
+                )?;
+            } else {
+                // BF16 / Ozaki / Short-seq (< 384) path (seq_len <= 512):
+                // ws_big = p_pool [0..18 MiB], ws_med = p_pool + 23 MiB [23..32 MiB <= 33 MiB]!
+                let ws_big = ws.p_pool;
+                let ws_med = ws.p_pool + 24_117_248;
+                run_prefill_gemm_i8(
+                    &self.cuda, &self.funcs.r10, self.funcs.residual_add,
+                    self.prefill_int8, seq_len, 18432, 2560, 512,
+                    normed, lyr.gate_up, self.w_unpack_buf, ws_big, 0, false,
+                    delta, hdr_b, ws.p_pool + 18_874_368, ws.pool_bytes - 18_874_368,
+                )?;
+                let mut gu_p = ws_big;
+                let mut act_p = ws_med;
+                self.cuda.launch(
+                    self.funcs.silu_mul_packed_2d,
+                    (36, seq_len as u32, 1),
+                    (256, 1, 1),
+                    &mut [
+                        &mut gu_p as *mut _ as *mut c_void,
+                        &mut act_p as *mut _ as *mut c_void,
+                        &mut inter as *mut _ as *mut c_void,
+                        &mut seq_i as *mut _ as *mut c_void,
+                    ],
+                )?;
+                run_prefill_gemm_i8(
+                    &self.cuda, &self.funcs.r10, self.funcs.residual_add,
+                    self.prefill_int8, seq_len, 2560, 9216, 512,
+                    ws_med, lyr.down, self.w_unpack_buf, h, delta, true,
+                    ws.p_pool, 24_117_248, 0, 0,
+                )?;
+            }
         }
         Ok(())
     }
@@ -2818,26 +3699,13 @@ impl RustSplitEngine {
         snap_t: i32,
     ) -> Result<(CUdeviceptr, CUdeviceptr)> {
         let seq_len = seg.len();
-        let (p_ids, p_h, p_nrm, p_del, p_co, p_dn_raw, p_big, p_med) = self.ensure_prefill_workspace(seq_len + nrm_row_off)?;
+        let ws = self.pf_ws;
+        let (p_ids, p_h, p_nrm) = (ws.p_ids, ws.p_h, ws.p_nrm);
         self.cuda.htod_async(p_ids, seg.as_ptr() as *const u8, seq_len * 8)?;
 
-        let mut ids_p = p_ids;
-        let mut emb_p = self.weights.embed_w;
         let mut h_p = p_h;
-        let mut sl: i32 = seq_len as i32;
         let mut dim: i32 = 2560;
-        self.cuda.launch(
-            self.funcs.embed_prefill,
-            (10, seq_len as u32, 1),
-            (256, 1, 1),
-            &mut [
-                &mut ids_p as *mut _ as *mut c_void,
-                &mut emb_p as *mut _ as *mut c_void,
-                &mut h_p as *mut _ as *mut c_void,
-                &mut sl as *mut _ as *mut c_void,
-                &mut dim as *mut _ as *mut c_void,
-            ],
-        )?;
+        launch_embed_prefill_bf12(&self.cuda, &self.funcs.bf12, p_ids, self.weights.embed_w, p_h, seq_len)?;
 
         let use_init = if start_pos > 0 { 1 } else { 0 };
         let (p1_rb, p2_rb) = if snap_t > 0 {
@@ -2846,8 +3714,8 @@ impl RustSplitEngine {
         } else {
             (None, None)
         };
-        self.run_stage_prefill_ops(&self.weights.p1_layers, &self.p1_cache.layers, p1_rb, p_h, p_nrm, p_del, p_co, p_dn_raw, p_big, p_med, start_pos, seq_len, use_init, snap_t)?;
-        self.run_stage_prefill_ops(&self.weights.p2_layers, &self.p2_cache.layers, p2_rb, p_h, p_nrm, p_del, p_co, p_dn_raw, p_big, p_med, start_pos, seq_len, use_init, snap_t)?;
+        self.run_stage_prefill_ops(&self.weights.p1_layers, &self.p1_cache.layers, p1_rb, start_pos, seq_len, use_init, snap_t)?;
+        self.run_stage_prefill_ops(&self.weights.p2_layers, &self.p2_cache.layers, p2_rb, start_pos, seq_len, use_init, snap_t)?;
 
         if compute_all_norm {
             let mut fnw = self.weights.final_norm_w;
@@ -2932,19 +3800,39 @@ impl RustSplitEngine {
             }
         }
 
-        const PREFILL_CHUNK: usize = 512;
+        // Phase R11 Adaptive Super-Chunk: start at compact 46.56 MiB (+0.00 MiB vs R9/R10!), and auto-upgrade once
+        // to 59.07 MiB 1024-Token Super-Chunk on the first long prompt (> 512 uncached tokens) in Smooth INT8 mode!
+        let uncached_len = prompt_ids.len().saturating_sub(cached_len);
+        if self.prefill_int8 == PrefillInt8Mode::Smooth && uncached_len > 512 && !self.pf_ws.is_1024() {
+            if let Ok((free_b, _)) = self.cuda.mem_info() {
+                // Free 46.56 MiB + alloc 59.07 MiB = +12.51 MiB net; safe whenever free >= 200 MiB
+                if free_b as f64 / 1048576.0 >= 200.0 {
+                    self.cuda.sync()?;
+                    self.cuda.free(self.pf_arena);
+                    let (new_arena, new_bytes, new_ws) = PrefillWorkspace::alloc_sized(&self.cuda, true)?;
+                    self.pf_arena = new_arena;
+                    self.pf_bytes = new_bytes;
+                    self.pf_ws = new_ws;
+                }
+            }
+        }
+        let prefill_chunk: usize = if self.prefill_int8 == PrefillInt8Mode::Smooth && self.pf_ws.is_1024() {
+            1024
+        } else {
+            512
+        };
         let mtp_enabled = self.mtp.is_some();
+        let has_rb_rec = self.mtp.as_ref().map(|m| m.p1_rb.iter().any(|r| r.rec_final != 0)).unwrap_or(false);
         let mut cur_pos = cached_len;
         let mut sys_cached_in_chunk = false;
 
-        // Phase R5: 512-Token Chunked Prefill (keeps pf_arena <= 46.6 MiB even at --max-seq 4096!)
-        // For prompts <= 512 tokens (or prefix-cached suffixes <= 512), this loop runs 0 times -> 100% single-pass!
-        while prompt_ids.len() - cur_pos > PREFILL_CHUNK {
-            let seg_len = PREFILL_CHUNK;
+        while prompt_ids.len() - cur_pos > prefill_chunk {
+            let seg_len = prefill_chunk;
             let seg = &prompt_ids[cur_pos..cur_pos + seg_len];
             let row_off = if mtp_enabled && has_prev_h_norm { 1 } else { 0 };
             let sys_in_this_chunk = enable_cache
                 && mtp_enabled
+                && has_rb_rec
                 && !sys_cached_in_chunk
                 && sys_prefix_len >= 12
                 && sys_prefix_len > cur_pos
@@ -2984,7 +3872,7 @@ impl RustSplitEngine {
         // Final Pass over remaining suffix `prompt_ids[cur_pos ..]` (<= 512 tokens, 0.0 ms snapshot overhead on TTFT!).
         let suffix = &prompt_ids[cur_pos..];
         let seq_len = suffix.len();
-        let deferred_hist_snap = if enable_cache && mtp_enabled {
+        let deferred_hist_snap = if enable_cache && mtp_enabled && has_rb_rec {
             if !sys_cached_in_chunk && sys_prefix_len >= 12 && sys_prefix_len > cur_pos && sys_prefix_len < prompt_ids.len() {
                 sys_prefix_len
             } else if hist_prefix_len >= 24 && hist_prefix_len > cur_pos && hist_prefix_len < prompt_ids.len() {
@@ -3038,36 +3926,7 @@ impl RustSplitEngine {
                 ],
             )?;
         }
-        self.cuda.gemm_bf16_nt(2, self.cfg.vocab_size, 2560, self.s_normed, self.weights.lm_head_w, self.s_logits)?;
-
-        let mut lg_p = self.s_logits;
-        let mut av_p = self.s_arg_vals;
-        let mut ai_p = self.s_arg_idxs;
-        let mut vocab_i: i32 = self.cfg.vocab_size as i32;
-        let mut nblk: i32 = 256;
-        let mut ntok_p = self.s_next_token_id;
-        self.cuda.launch(
-            self.funcs.argmax_stage1,
-            (256, 1, 1),
-            (256, 1, 1),
-            &mut [
-                &mut lg_p as *mut _ as *mut c_void,
-                &mut av_p as *mut _ as *mut c_void,
-                &mut ai_p as *mut _ as *mut c_void,
-                &mut vocab_i as *mut _ as *mut c_void,
-            ],
-        )?;
-        self.cuda.launch(
-            self.funcs.argmax_stage2,
-            (1, 1, 1),
-            (256, 1, 1),
-            &mut [
-                &mut av_p as *mut _ as *mut c_void,
-                &mut ai_p as *mut _ as *mut c_void,
-                &mut ntok_p as *mut _ as *mut c_void,
-                &mut nblk as *mut _ as *mut c_void,
-            ],
-        )?;
+        self.launch_lm_head_argmax(1, self.s_normed, self.s_arg_vals, self.s_arg_idxs, self.s_next_token_id)?;
 
         self.cuda.sync()?;
         let mut first_tok: i64 = 0;
@@ -3099,7 +3958,7 @@ impl RustSplitEngine {
         F: FnMut(StreamToken) -> bool,
     {
         self.cuda.bind_context()?;
-        let mtp_guard = if self.mtp.is_some() { 5 } else { 1 };
+        let mtp_guard = self.mtp.as_ref().map(|m| m.verify_m + 1).unwrap_or(1);
         let mut pids = prompt_ids;
         let mut spl = sys_prefix_len;
         let mut hpl = hist_prefix_len;
@@ -3144,8 +4003,9 @@ impl RustSplitEngine {
             return Ok(());
         }
 
-        // ---- Phase R3 + R4: Zero-Sync GPU-Resident MTP Speculative Decoding Path ----
-        if self.mtp.is_some() && prompt_len + max_new_tokens + 4 < self.max_seq {
+        // ---- Phase R3 + R4 + R13: Zero-Sync GPU-Resident MTP Speculative Decoding Path ----
+        let mtp_vm = self.mtp.as_ref().map(|m| m.verify_m).unwrap_or(0);
+        if mtp_vm > 0 && prompt_len + max_new_tokens + mtp_vm < self.max_seq {
             // Yield first_tok IMMEDIATELY -> ZERO MTP overhead on TTFT!
             let keep_going = on_token(StreamToken {
                 token_id: first_tok,
@@ -3173,7 +4033,7 @@ impl RustSplitEngine {
                 v.push(first_tok);
                 (0, v)
             };
-            let (_, _, p_nrm, _, _, _, _, _) = self.ensure_prefill_workspace(shifted_ids.len())?;
+            let p_nrm = self.pf_ws.p_nrm;
             let _ = self.run_mtp_prefill_range(mtp_start_pos, &shifted_ids, p_nrm, true)?;
 
             // Deferred Single-Pass History Snapshot (0.0 ms on TTFT! 0 extra 8 GB weight passes!)
@@ -3194,8 +4054,8 @@ impl RustSplitEngine {
                 self.cuda.sync()?;
                 let (draft_k, _verify_m, drafts, v_toks) = {
                     let m = self.mtp.as_ref().unwrap();
-                    let mut d = [0i64; 3];
-                    let mut v = [0i64; 4];
+                    let mut d = [0i64; 4];
+                    let mut v = [0i64; 5];
                     unsafe {
                         for i in 0..m.draft_k {
                             d[i] = *m.h_draft_toks.add(i);
@@ -3412,7 +4272,7 @@ impl RustSplitEngine {
         let mut shifted = Vec::with_capacity(prompt_len);
         shifted.extend_from_slice(&prompt_ids[1..]);
         shifted.push(first_tok);
-        let (_, _, p_nrm, _, _, _, _, _) = self.ensure_prefill_workspace(shifted.len())?;
+        let p_nrm = self.pf_ws.p_nrm;
         let _ = self.run_mtp_prefill_range(0, &shifted, p_nrm, true)?;
 
         let mut cur_tok = first_tok;
@@ -3426,8 +4286,8 @@ impl RustSplitEngine {
             self.cuda.sync()?;
             let (draft_k, drafts, v_toks) = {
                 let m = self.mtp.as_ref().unwrap();
-                let mut d = [0i64; 3];
-                let mut v = [0i64; 4];
+                let mut d = [0i64; 4];
+                let mut v = [0i64; 5];
                 unsafe {
                     for i in 0..m.draft_k {
                         d[i] = *m.h_draft_toks.add(i);

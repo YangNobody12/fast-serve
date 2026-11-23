@@ -12,9 +12,14 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::config::TextConfig;
 use crate::cuda_ffi::{CUdeviceptr, CUfunction, CUgraphExec, CudaRuntime};
-use crate::engine::{build_rope_tables_bf16, run_deltanet_prefill_wy, StreamToken, WyKernelFuncs, PTX_BYTES};
+use crate::engine::{
+    build_rope_tables_bf16, launch_embed_prefill_bf12, launch_lm_head_bf12_argmax,
+    launch_skinny_bf12, run_deltanet_prefill_wy, run_prefill_fused_tiled_mlp_i8,
+    run_prefill_gemm_i8, Bf12DecodeFuncs, Int8PrefillFuncs, PrefillInt8Mode, PrefillWorkspace,
+    StreamToken, WyKernelFuncs, PF_HEADER_ROWS, PF_POOL_BYTES, PTX_BYTES, W_UNPACK_BYTES,
+};
 use crate::kv_pool::{DeltaNetSlotPool, KvBlockPool, KV_BLOCK_BYTES, KV_BLOCK_SIZE, MAX_BLOCKS_PER_SEQ};
-use crate::loader::{load_split_weights, LoadedSplitWeights, PackedLayerPtrs};
+use crate::loader::{load_split_weights, Bf12Ptr, LoadedSplitWeights, PackedLayerPtrs};
 use crate::tokenizer::QwenTokenizer;
 
 struct BatchKernelFuncs {
@@ -23,20 +28,12 @@ struct BatchKernelFuncs {
     silu_mul_packed_2d: CUfunction,
     residual_add: CUfunction,
     copy_bf16: CUfunction,
-    embed_prefill: CUfunction,
     conv1d_prefill: CUfunction,
     deltanet_prefill: CUfunction,
     deltanet_prefill_norm_gate: CUfunction,
-    argmax_stage1: CUfunction,
     argmax_stage2: CUfunction,
-    argmax_batch_stage1: CUfunction,
     argmax_batch_stage2: CUfunction,
     gqa_verify_m_reduce: CUfunction,
-    // Phase R6.1: 8-Warp Coalesced Skinny GEMM + Fused Residual
-    skinny_gemm_m1: CUfunction,
-    skinny_gemm_m2: CUfunction,
-    skinny_gemm_m3: CUfunction,
-    skinny_gemm_m4: CUfunction,
     // Phase R7: Batched & Paged KV kernels
     conv1d_batch_decode: CUfunction,
     deltanet_batch_decode: CUfunction,
@@ -46,10 +43,14 @@ struct BatchKernelFuncs {
     paged_gqa_flash_splitk: CUfunction,
     // Phase R8: Chunked WY-Form DeltaNet Prefill
     wy: WyKernelFuncs,
-    // Phase R9: 2D Parallel Conv1D Prefill + Paged WMMA BF16 FlashAttention-2
+    // Phase R9: 2D Parallel Conv1D Prefill
     conv1d_prefill_2d: CUfunction,
     conv1d_update_state: CUfunction,
-    prefill_gqa_paged_wmma: CUfunction,
+    // Phase R10 + R11 + R12: SmoothQuant PTX-IMMA + Register-Resident 32x16 Paged FA2
+    r10: Int8PrefillFuncs,
+    prefill_gqa_paged_wmma_32x16: CUfunction,
+    // Phase R14: Lossless BF12 Embed + Skinny Decode + Batched Fused lm_head_argmax (B=1..4)
+    bf12: Bf12DecodeFuncs,
 }
 
 impl BatchKernelFuncs {
@@ -60,19 +61,12 @@ impl BatchKernelFuncs {
             silu_mul_packed_2d: cuda.get_func("silu_mul_packed_2d_bf16")?,
             residual_add: cuda.get_func("residual_add_bf16")?,
             copy_bf16: cuda.get_func("copy_bf16")?,
-            embed_prefill: cuda.get_func("embed_lookup_prefill_bf16")?,
             conv1d_prefill: cuda.get_func("causal_conv1d_prefill_k4_bf16")?,
             deltanet_prefill: cuda.get_func("gated_deltanet_prefill_bf16")?,
             deltanet_prefill_norm_gate: cuda.get_func("deltanet_prefill_norm_gate_bf16")?,
-            argmax_stage1: cuda.get_func("argmax_stage1_bf16")?,
             argmax_stage2: cuda.get_func("argmax_stage2_bf16")?,
-            argmax_batch_stage1: cuda.get_func("argmax_batch_stage1_bf16")?,
             argmax_batch_stage2: cuda.get_func("argmax_batch_stage2_bf16")?,
             gqa_verify_m_reduce: cuda.get_func("gqa_verify_m_flash_reduce_bf16")?,
-            skinny_gemm_m1: cuda.get_func("skinny_gemm_m1_2wpr_bf16")?,
-            skinny_gemm_m2: cuda.get_func("skinny_gemm_m2_1wpr_bf16")?,
-            skinny_gemm_m3: cuda.get_func("skinny_gemm_m3_1wpr_bf16")?,
-            skinny_gemm_m4: cuda.get_func("skinny_gemm_m4_1wpr_bf16")?,
             conv1d_batch_decode: cuda.get_func("causal_conv1d_batch_decode_bf16")?,
             deltanet_batch_decode: cuda.get_func("gated_deltanet_batch_decode_bf16")?,
             qk_rope_paged_prefill: cuda.get_func("qk_rope_paged_kv_prefill_bf16")?,
@@ -82,7 +76,9 @@ impl BatchKernelFuncs {
             wy: WyKernelFuncs::load(cuda)?,
             conv1d_prefill_2d: cuda.get_func("causal_conv1d_prefill_2d_bf16")?,
             conv1d_update_state: cuda.get_func("causal_conv1d_update_state_bf16")?,
-            prefill_gqa_paged_wmma: cuda.get_func("prefill_gqa_paged_wmma_causal_gated_bf16")?,
+            r10: Int8PrefillFuncs::load(cuda)?,
+            prefill_gqa_paged_wmma_32x16: cuda.get_func("prefill_gqa_paged_wmma_32x16_causal_gated_bf16")?,
+            bf12: Bf12DecodeFuncs::load(cuda)?,
         })
     }
 }
@@ -166,9 +162,8 @@ pub struct BatchGpuEngine {
     d_flash_ml: CUdeviceptr,     // [4, 16, 4, 2] f32
     d_mlp_gu: CUdeviceptr,       // [4, 18432] bf16
     d_mlp_act: CUdeviceptr,      // [4, 9216] bf16
-    d_logits: CUdeviceptr,       // [4, vocab_size] bf16
-    d_arg_vals: CUdeviceptr,     // [4, 256] f32
-    d_arg_idxs: CUdeviceptr,     // [4, 256] i32
+    d_arg_vals: CUdeviceptr,     // [4, 1024] f32 (Phase R14: d_logits freed!)
+    d_arg_idxs: CUdeviceptr,     // [4, 1024] i32
     h_out_toks: *mut i64,        // [4] pinned host
     // Phase R9: Single contiguous pinned host meta buffer (eliminates 7x pageable WDDM HtoD stalls!)
     h_meta_pinned: *mut u8,
@@ -177,21 +172,17 @@ pub struct BatchGpuEngine {
     meta_off_slt: usize,
     meta_off_bt: usize,
 
-    // Pre-allocated 512-token Chunked Prefill Workspace (~46.6 MiB fixed!)
+    // Pre-allocated 1024-token Super-Chunk Prefill Workspace + shared 90.0 MiB BF12 unpack buffer
     pf_arena: CUdeviceptr,
     pf_bytes: usize,
-    p_ids: CUdeviceptr,
-    p_h: CUdeviceptr,
-    p_nrm: CUdeviceptr,
-    p_del: CUdeviceptr,
-    p_co: CUdeviceptr,
-    p_dn_raw: CUdeviceptr,
-    p_big: CUdeviceptr,
-    p_med: CUdeviceptr,
+    pf_ws: PrefillWorkspace,
+    w_unpack_buf: CUdeviceptr,
     d_pf_bt: CUdeviceptr,        // [MAX_BLOCKS_PER_SEQ] i32
 
     // Phase R7.1: Pre-captured Batched Decode CUDA Graphs for B = 1..=max_batch (1 launch/step!)
     decode_graphs: Vec<CUgraphExec>,
+    // Phase R10: Online SmoothQuant / Ozaki INT8 Tensor Core Prefill mode
+    prefill_int8: PrefillInt8Mode,
 }
 
 unsafe impl Send for BatchGpuEngine {}
@@ -203,6 +194,7 @@ impl BatchGpuEngine {
         max_seq: usize,
         max_batch: usize,
         force_max_seq: bool,
+        prefill_int8: PrefillInt8Mode,
     ) -> Result<Self> {
         let t0 = Instant::now();
         let max_batch = max_batch.clamp(1, 4);
@@ -231,7 +223,7 @@ impl BatchGpuEngine {
         let (free_b, _) = cuda.mem_info()?;
         let free_mib = free_b as f64 / 1048576.0;
         let dn_mib = (max_batch as f64) * 49.5;
-        let fixed_mib = dn_mib + 46.6 + 12.0 + 1.0; // DeltaNet + pf_arena + scratch + RoPE
+        let fixed_mib = dn_mib + 56.0 + 90.0 + 12.0 + 1.0; // DeltaNet + pf_arena (55.6) + w_unpack (90) + scratch + RoPE
         let wddm_guard_mib = 380.0;
         // Desired pooled blocks: enough for 4096 tokens (256 blocks = 128 MiB) or capped to stay WDDM-safe!
         let desired_blocks = (max_seq.max(2048) * 2 / KV_BLOCK_SIZE).clamp(128, 256);
@@ -292,33 +284,21 @@ impl BatchGpuEngine {
         let o_fm  = next(4 * 16 * 4 * 2 * 4);
         let o_gu  = next(4 * 18432 * 2);
         let o_ac  = next(4 * 9216 * 2);
-        let o_lg  = next(4 * cfg.vocab_size * 2);
-        let o_av  = next(4 * 256 * 4);
-        let o_ai  = next(4 * 256 * 4);
+        // Phase R14: d_logits freed (-1.9 MiB) — Batch Decode uses lm_head_bf12_argmax_m{1..4}!
+        let o_av  = next(4 * 1024 * 4);
+        let o_ai  = next(4 * 1024 * 4);
         let scratch_arena = cuda.alloc(off)?;
         cuda.memset_zero_async(scratch_arena, off)?;
         let h_out_toks = cuda.alloc_pinned(4 * 8)? as *mut i64;
         let h_meta_pinned = cuda.alloc_pinned(meta_bytes)?;
         unsafe { std::ptr::write_bytes(h_meta_pinned, 0, meta_bytes); }
 
-        // Pre-allocate 512-token Chunked Prefill Workspace (~46.6 MiB fixed!)
-        let c = 512usize;
-        let mut poff = 0usize;
-        let mut pnext = |b: usize| {
-            let cur = poff;
-            poff += align(b);
-            cur as u64
-        };
-        let po_ids = pnext(c * 8);
-        let po_h   = pnext(c * 2560 * 2);
-        let po_nrm = pnext(c * 2560 * 2);
-        let po_del = pnext(c * 2560 * 2);
-        let po_co  = pnext(c * 4096 * 2);
-        let po_raw = pnext(c * 4096 * 4);
-        let po_big = pnext(c * 18432 * 2);
-        let po_med = pnext(c * 9216 * 2);
-        let po_bt  = pnext(MAX_BLOCKS_PER_SEQ * 4);
-        let pf_arena = cuda.alloc(poff)?;
+        // Pre-allocate 1024-token Super-Chunk Prefill Workspace + shared 90.0 MiB BF12 unpack buffer
+        let (pf_arena, pf_ws_bytes, pf_ws) = PrefillWorkspace::alloc(&cuda)?;
+        let w_unpack_buf = cuda.alloc(W_UNPACK_BYTES)?;
+        let bt_bytes = align(MAX_BLOCKS_PER_SEQ * 4);
+        let d_pf_bt = cuda.alloc(bt_bytes)?;
+        let poff = pf_ws_bytes + W_UNPACK_BYTES + bt_bytes;
         cuda.sync()?;
 
         let mut eng = Self {
@@ -358,7 +338,6 @@ impl BatchGpuEngine {
             d_flash_ml: scratch_arena + o_fm,
             d_mlp_gu: scratch_arena + o_gu,
             d_mlp_act: scratch_arena + o_ac,
-            d_logits: scratch_arena + o_lg,
             d_arg_vals: scratch_arena + o_av,
             d_arg_idxs: scratch_arena + o_ai,
             h_out_toks,
@@ -369,16 +348,11 @@ impl BatchGpuEngine {
             meta_off_bt: o_bt as usize,
             pf_arena,
             pf_bytes: poff,
-            p_ids: pf_arena + po_ids,
-            p_h: pf_arena + po_h,
-            p_nrm: pf_arena + po_nrm,
-            p_del: pf_arena + po_del,
-            p_co: pf_arena + po_co,
-            p_dn_raw: pf_arena + po_raw,
-            p_big: pf_arena + po_big,
-            p_med: pf_arena + po_med,
-            d_pf_bt: pf_arena + po_bt,
+            pf_ws,
+            w_unpack_buf,
+            d_pf_bt,
             decode_graphs: Vec::with_capacity(max_batch),
+            prefill_int8,
         };
         eng.capture_batch_decode_graphs()?;
         eng.load_time_s = t0.elapsed().as_secs_f64();
@@ -422,33 +396,8 @@ impl BatchGpuEngine {
         total as f64 / (1024.0 * 1024.0)
     }
 
-    fn launch_skinny_gemm(&self, m: usize, n: usize, k: usize, x: CUdeviceptr, w: CUdeviceptr, y: CUdeviceptr, add_res: bool) -> Result<()> {
-        let mut x_p = x;
-        let mut w_p = w;
-        let mut y_p = y;
-        let mut n_i: i32 = n as i32;
-        let mut k_i: i32 = k as i32;
-        let mut add_i: i32 = if add_res { 1 } else { 0 };
-        let (func, grid_x) = match m {
-            1 => (self.funcs.skinny_gemm_m1, ((n + 3) / 4) as u32),
-            2 => (self.funcs.skinny_gemm_m2, ((n + 7) / 8) as u32),
-            3 => (self.funcs.skinny_gemm_m3, ((n + 7) / 8) as u32),
-            4 => (self.funcs.skinny_gemm_m4, ((n + 7) / 8) as u32),
-            _ => unreachable!("launch_skinny_gemm M=1..4"),
-        };
-        self.cuda.launch(
-            func,
-            (grid_x, 1, 1),
-            (256, 1, 1),
-            &mut [
-                &mut x_p as *mut _ as *mut c_void,
-                &mut w_p as *mut _ as *mut c_void,
-                &mut y_p as *mut _ as *mut c_void,
-                &mut n_i as *mut _ as *mut c_void,
-                &mut k_i as *mut _ as *mut c_void,
-                &mut add_i as *mut _ as *mut c_void,
-            ],
-        )
+    fn launch_skinny_gemm(&self, m: usize, _n: usize, _k: usize, x: CUdeviceptr, w: Bf12Ptr, y: CUdeviceptr, add_res: bool) -> Result<()> {
+        launch_skinny_bf12(&self.cuda, &self.funcs.bf12, m, x, w, y, add_res)
     }
 
     fn run_stage_paged_prefill(
@@ -459,6 +408,11 @@ impl BatchGpuEngine {
         start_pos: usize,
         seq_len: usize,
     ) -> Result<()> {
+        let ws = self.pf_ws;
+        let hdr_b = PF_HEADER_ROWS * 2560 * 2;
+        let align256 = |b: usize| (b + 255) & !255;
+        let m_pad = (seq_len + 3) & !3;
+
         let mut dim: i32 = 2560;
         let mut eps: f32 = self.cfg.rms_norm_eps;
         let mut seq_i: i32 = seq_len as i32;
@@ -466,14 +420,13 @@ impl BatchGpuEngine {
         let mut c8192: i32 = 8192;
         let mut stride_dn: i32 = 12352;
         let mut inter: i32 = 9216;
-        let mut total_h: i32 = (seq_len * 2560) as i32;
-        let mut use_init: i32 = if start_pos > 0 { 1 } else { 0 };
+        let use_init_base: i32 = if start_pos > 0 { 1 } else { 0 };
         let mut snap_zero: i32 = 0;
 
         for (lyr, &sidx) in layers.iter().zip(sub_idxs.iter()) {
-            let mut h_p = self.p_h;
+            let mut h_p = ws.p_h;
             let mut nw_p = lyr.in_norm;
-            let mut nrm_p = self.p_nrm;
+            let mut nrm_p = ws.p_nrm;
             self.cuda.launch(
                 self.funcs.rmsnorm_2d,
                 (seq_len as u32, 1, 1),
@@ -488,131 +441,165 @@ impl BatchGpuEngine {
             )?;
 
             if lyr.is_linear {
-                self.cuda.gemm_bf16_nt(seq_len, 12352, 2560, self.p_nrm, lyr.in_all, self.p_big)?;
-                let mut pin = self.p_big;
-                let mut cs = self.dn_pool.conv_ptr(slot_id, sidx);
-                let mut cs_snap: CUdeviceptr = 0;
-                let mut cw = lyr.conv_w;
-                let mut cv_out = self.p_med;
-                if seq_len >= 64 {
-                    let t_tiles = ((seq_len + 31) / 32) as u32;
-                    self.cuda.launch(
-                        self.funcs.conv1d_prefill_2d,
-                        (32, t_tiles, 1),
-                        (256, 1, 1),
-                        &mut [
-                            &mut pin as *mut _ as *mut c_void,
-                            &mut cs as *mut _ as *mut c_void,
-                            &mut cs_snap as *mut _ as *mut c_void,
-                            &mut cw as *mut _ as *mut c_void,
-                            &mut cv_out as *mut _ as *mut c_void,
-                            &mut seq_i as *mut _ as *mut c_void,
-                            &mut c8192 as *mut _ as *mut c_void,
-                            &mut stride_dn as *mut _ as *mut c_void,
-                            &mut use_init as *mut _ as *mut c_void,
-                            &mut snap_zero as *mut _ as *mut c_void,
-                        ],
-                    )?;
-                    self.cuda.launch(
-                        self.funcs.conv1d_update_state,
-                        (32, 1, 1),
-                        (256, 1, 1),
-                        &mut [
-                            &mut pin as *mut _ as *mut c_void,
-                            &mut cs as *mut _ as *mut c_void,
-                            &mut seq_i as *mut _ as *mut c_void,
-                            &mut c8192 as *mut _ as *mut c_void,
-                            &mut stride_dn as *mut _ as *mut c_void,
-                            &mut use_init as *mut _ as *mut c_void,
-                        ],
-                    )?;
-                } else {
-                    self.cuda.launch(
-                        self.funcs.conv1d_prefill,
-                        (32, 1, 1),
-                        (256, 1, 1),
-                        &mut [
-                            &mut pin as *mut _ as *mut c_void,
-                            &mut cs as *mut _ as *mut c_void,
-                            &mut cs_snap as *mut _ as *mut c_void,
-                            &mut cw as *mut _ as *mut c_void,
-                            &mut cv_out as *mut _ as *mut c_void,
-                            &mut seq_i as *mut _ as *mut c_void,
-                            &mut c8192 as *mut _ as *mut c_void,
-                            &mut stride_dn as *mut _ as *mut c_void,
-                            &mut use_init as *mut _ as *mut c_void,
-                            &mut snap_zero as *mut _ as *mut c_void,
-                        ],
-                    )?;
+                let p_in_all = ws.p_pool;
+                let in_all_b = align256(m_pad * 12352 * 2);
+                run_prefill_gemm_i8(
+                    &self.cuda, &self.funcs.r10, self.funcs.residual_add,
+                    self.prefill_int8, seq_len, 12352, 2560, 1024,
+                    ws.p_nrm, lyr.in_all, self.w_unpack_buf, p_in_all, 0, false,
+                    ws.p_del, hdr_b, ws.p_pool + in_all_b as u64, PF_POOL_BYTES - in_all_b,
+                )?;
+
+                let p_core_out = ws.p_pool + 25_427_968;
+                let p_wy_dn_raw = ws.p_pool + 33_816_576;
+                let rec_ptr = self.dn_pool.rec_ptr(slot_id, sidx);
+
+                let mut sub_start = 0usize;
+                while sub_start < seq_len {
+                    let sub_len = (seq_len - sub_start).min(256);
+                    let mut sub_len_i: i32 = sub_len as i32;
+                    let mut sub_use_init: i32 = if use_init_base != 0 || sub_start > 0 { 1 } else { 0 };
+                    let mut pin = p_in_all + (sub_start * 12352 * 2) as u64;
+                    let sub_co = p_core_out + (sub_start * 4096 * 2) as u64;
+                    let mut cs = self.dn_pool.conv_ptr(slot_id, sidx);
+                    let mut cs_snap: CUdeviceptr = 0;
+                    let mut cw = lyr.conv_w;
+                    let mut cv_out = ws.p_del;
+
+                    if sub_len >= 64 {
+                        let t_tiles = ((sub_len + 31) / 32) as u32;
+                        self.cuda.launch(
+                            self.funcs.conv1d_prefill_2d,
+                            (32, t_tiles, 1),
+                            (256, 1, 1),
+                            &mut [
+                                &mut pin as *mut _ as *mut c_void,
+                                &mut cs as *mut _ as *mut c_void,
+                                &mut cs_snap as *mut _ as *mut c_void,
+                                &mut cw as *mut _ as *mut c_void,
+                                &mut cv_out as *mut _ as *mut c_void,
+                                &mut sub_len_i as *mut _ as *mut c_void,
+                                &mut c8192 as *mut _ as *mut c_void,
+                                &mut stride_dn as *mut _ as *mut c_void,
+                                &mut sub_use_init as *mut _ as *mut c_void,
+                                &mut snap_zero as *mut _ as *mut c_void,
+                            ],
+                        )?;
+                        self.cuda.launch(
+                            self.funcs.conv1d_update_state,
+                            (32, 1, 1),
+                            (256, 1, 1),
+                            &mut [
+                                &mut pin as *mut _ as *mut c_void,
+                                &mut cs as *mut _ as *mut c_void,
+                                &mut sub_len_i as *mut _ as *mut c_void,
+                                &mut c8192 as *mut _ as *mut c_void,
+                                &mut stride_dn as *mut _ as *mut c_void,
+                                &mut sub_use_init as *mut _ as *mut c_void,
+                            ],
+                        )?;
+                    } else {
+                        self.cuda.launch(
+                            self.funcs.conv1d_prefill,
+                            (32, 1, 1),
+                            (256, 1, 1),
+                            &mut [
+                                &mut pin as *mut _ as *mut c_void,
+                                &mut cs as *mut _ as *mut c_void,
+                                &mut cs_snap as *mut _ as *mut c_void,
+                                &mut cw as *mut _ as *mut c_void,
+                                &mut cv_out as *mut _ as *mut c_void,
+                                &mut sub_len_i as *mut _ as *mut c_void,
+                                &mut c8192 as *mut _ as *mut c_void,
+                                &mut stride_dn as *mut _ as *mut c_void,
+                                &mut sub_use_init as *mut _ as *mut c_void,
+                                &mut snap_zero as *mut _ as *mut c_void,
+                            ],
+                        )?;
+                    }
+
+                    if sub_len >= 192 {
+                        run_deltanet_prefill_wy(
+                            &self.cuda,
+                            &self.funcs.wy,
+                            cv_out,
+                            pin,
+                            lyr.dt_bias,
+                            lyr.a_log_f32,
+                            lyr.dn_norm,
+                            rec_ptr,
+                            0,
+                            p_wy_dn_raw,
+                            ws.p_nrm,
+                            sub_co,
+                            sub_len,
+                            sub_use_init,
+                            0,
+                            eps,
+                        )?;
+                    } else {
+                        let mut dtb = lyr.dt_bias;
+                        let mut alog = lyr.a_log_f32;
+                        let mut dnw = lyr.dn_norm;
+                        let mut rec = rec_ptr;
+                        let mut rec_snap: CUdeviceptr = 0;
+                        let mut raw_p = p_wy_dn_raw;
+                        let mut co = sub_co;
+                        self.cuda.launch(
+                            self.funcs.deltanet_prefill,
+                            (32, 4, 1),
+                            (128, 1, 1),
+                            &mut [
+                                &mut cv_out as *mut _ as *mut c_void,
+                                &mut pin as *mut _ as *mut c_void,
+                                &mut dtb as *mut _ as *mut c_void,
+                                &mut alog as *mut _ as *mut c_void,
+                                &mut rec as *mut _ as *mut c_void,
+                                &mut rec_snap as *mut _ as *mut c_void,
+                                &mut raw_p as *mut _ as *mut c_void,
+                                &mut sub_len_i as *mut _ as *mut c_void,
+                                &mut sub_use_init as *mut _ as *mut c_void,
+                                &mut snap_zero as *mut _ as *mut c_void,
+                            ],
+                        )?;
+                        self.cuda.launch(
+                            self.funcs.deltanet_prefill_norm_gate,
+                            (32, sub_len as u32, 1),
+                            (128, 1, 1),
+                            &mut [
+                                &mut raw_p as *mut _ as *mut c_void,
+                                &mut pin as *mut _ as *mut c_void,
+                                &mut dnw as *mut _ as *mut c_void,
+                                &mut co as *mut _ as *mut c_void,
+                                &mut eps as *mut _ as *mut c_void,
+                            ],
+                        )?;
+                    }
+                    sub_start += sub_len;
                 }
 
-                let rec_ptr = self.dn_pool.rec_ptr(slot_id, sidx);
-                if seq_len >= 192 && seq_len <= 512 {
-                    run_deltanet_prefill_wy(
-                        &self.cuda,
-                        &self.funcs.wy,
-                        cv_out,
-                        pin,
-                        lyr.dt_bias,
-                        lyr.a_log_f32,
-                        lyr.dn_norm,
-                        rec_ptr,
-                        0,
-                        self.p_dn_raw,
-                        self.p_big,
-                        self.p_co,
-                        seq_len,
-                        use_init,
-                        0,
-                        eps,
-                    )?;
-                } else {
-                    let mut dtb = lyr.dt_bias;
-                    let mut alog = lyr.a_log_f32;
-                    let mut dnw = lyr.dn_norm;
-                    let mut rec = rec_ptr;
-                    let mut rec_snap: CUdeviceptr = 0;
-                    let mut raw_p = self.p_dn_raw;
-                    let mut co = self.p_co;
-                    self.cuda.launch(
-                        self.funcs.deltanet_prefill,
-                        (32, 4, 1),
-                        (128, 1, 1),
-                        &mut [
-                            &mut cv_out as *mut _ as *mut c_void,
-                            &mut pin as *mut _ as *mut c_void,
-                            &mut dtb as *mut _ as *mut c_void,
-                            &mut alog as *mut _ as *mut c_void,
-                            &mut rec as *mut _ as *mut c_void,
-                            &mut rec_snap as *mut _ as *mut c_void,
-                            &mut raw_p as *mut _ as *mut c_void,
-                            &mut seq_i as *mut _ as *mut c_void,
-                            &mut use_init as *mut _ as *mut c_void,
-                            &mut snap_zero as *mut _ as *mut c_void,
-                        ],
-                    )?;
-                    self.cuda.launch(
-                        self.funcs.deltanet_prefill_norm_gate,
-                        (32, seq_len as u32, 1),
-                        (128, 1, 1),
-                        &mut [
-                            &mut raw_p as *mut _ as *mut c_void,
-                            &mut pin as *mut _ as *mut c_void,
-                            &mut dnw as *mut _ as *mut c_void,
-                            &mut co as *mut _ as *mut c_void,
-                            &mut eps as *mut _ as *mut c_void,
-                        ],
-                    )?;
-                }
-                self.cuda.gemm_bf16_nt(seq_len, 2560, 4096, self.p_co, lyr.out_proj, self.p_del)?;
+                run_prefill_gemm_i8(
+                    &self.cuda, &self.funcs.r10, self.funcs.residual_add,
+                    self.prefill_int8, seq_len, 2560, 4096, 1024,
+                    p_core_out, lyr.out_proj, self.w_unpack_buf, ws.p_del, 0, false,
+                    ws.p_nrm, hdr_b, ws.p_pool, 25_427_968,
+                )?;
             } else {
-                self.cuda.gemm_bf16_nt(seq_len, 10240, 2560, self.p_nrm, lyr.qkv, self.p_big)?;
-                let mut qkv_p = self.p_big;
+                let p_qkv = ws.p_pool;
+                let qkv_b = align256(m_pad * 10240 * 2);
+                run_prefill_gemm_i8(
+                    &self.cuda, &self.funcs.r10, self.funcs.residual_add,
+                    self.prefill_int8, seq_len, 10240, 2560, 1024,
+                    ws.p_nrm, lyr.qkv, self.w_unpack_buf, p_qkv, 0, false,
+                    ws.p_del, hdr_b, ws.p_pool + qkv_b as u64, PF_POOL_BYTES - qkv_b,
+                )?;
+                let mut qkv_p = p_qkv;
                 let mut qnw = lyr.q_norm;
                 let mut knw = lyr.k_norm;
                 let mut cos_p = self.cos_table;
                 let mut sin_p = self.sin_table;
-                let mut q_sdpa = self.p_med;
+                let mut q_sdpa = ws.p_pool + 20_971_520;
+                let p_core_out = ws.p_pool + 29_360_128;
                 let mut kvp = self.kv_pool.arena;
                 let mut bt_p = self.d_pf_bt;
                 let mut fa_i: i32 = sidx as i32;
@@ -635,11 +622,11 @@ impl BatchGpuEngine {
                         &mut eps as *mut _ as *mut c_void,
                     ],
                 )?;
-                let mut co = self.p_co;
+                let mut co = p_core_out;
                 if seq_len >= 64 {
-                    let q_tiles = ((seq_len + 15) / 16) as u32;
+                    let q_tiles = ((seq_len + 31) / 32) as u32;
                     self.cuda.launch(
-                        self.funcs.prefill_gqa_paged_wmma,
+                        self.funcs.prefill_gqa_paged_wmma_32x16,
                         (16, q_tiles, 1),
                         (128, 1, 1),
                         &mut [
@@ -671,10 +658,15 @@ impl BatchGpuEngine {
                         ],
                     )?;
                 }
-                self.cuda.gemm_bf16_nt(seq_len, 2560, 4096, self.p_co, lyr.o_proj, self.p_del)?;
+                run_prefill_gemm_i8(
+                    &self.cuda, &self.funcs.r10, self.funcs.residual_add,
+                    self.prefill_int8, seq_len, 2560, 4096, 1024,
+                    p_core_out, lyr.o_proj, self.w_unpack_buf, ws.p_del, 0, false,
+                    ws.p_nrm, hdr_b, ws.p_pool, 29_360_128,
+                )?;
             }
 
-            let mut del_p = self.p_del;
+            let mut del_p = ws.p_del;
             let mut pnw = lyr.post_norm;
             self.cuda.launch(
                 self.funcs.add_rmsnorm_2d,
@@ -690,75 +682,73 @@ impl BatchGpuEngine {
                 ],
             )?;
 
-            self.cuda.gemm_bf16_nt(seq_len, 18432, 2560, self.p_nrm, lyr.gate_up, self.p_big)?;
-            let mut gu_p = self.p_big;
-            let mut act_p = self.p_med;
-            self.cuda.launch(
-                self.funcs.silu_mul_packed_2d,
-                (36, seq_len as u32, 1),
-                (256, 1, 1),
-                &mut [
-                    &mut gu_p as *mut _ as *mut c_void,
-                    &mut act_p as *mut _ as *mut c_void,
-                    &mut inter as *mut _ as *mut c_void,
-                    &mut seq_i as *mut _ as *mut c_void,
-                ],
-            )?;
-            self.cuda.gemm_bf16_nt(seq_len, 2560, 9216, self.p_med, lyr.down, self.p_del)?;
-
-            let blocks = ((seq_len * 2560 + 255) / 256) as u32;
-            self.cuda.launch(
-                self.funcs.residual_add,
-                (blocks, 1, 1),
-                (256, 1, 1),
-                &mut [
-                    &mut h_p as *mut _ as *mut c_void,
-                    &mut del_p as *mut _ as *mut c_void,
-                    &mut total_h as *mut _ as *mut c_void,
-                ],
-            )?;
+            if self.prefill_int8 == PrefillInt8Mode::Smooth && seq_len >= 64 && m_pad <= 1024 {
+                run_prefill_fused_tiled_mlp_i8(
+                    &self.cuda,
+                    &self.funcs.r10,
+                    seq_len,
+                    ws.p_nrm,
+                    lyr.gate_up,
+                    lyr.down,
+                    ws.p_h,
+                    ws.p_del,
+                    ws.p_pool,
+                )?;
+            } else {
+                let ws_big = ws.p_pool;
+                let ws_med = ws.p_pool + 31_457_280;
+                run_prefill_gemm_i8(
+                    &self.cuda, &self.funcs.r10, self.funcs.residual_add,
+                    self.prefill_int8, seq_len, 18432, 2560, 512,
+                    ws.p_nrm, lyr.gate_up, self.w_unpack_buf, ws_big, 0, false,
+                    ws.p_del, hdr_b, ws.p_pool + 18_874_368, PF_POOL_BYTES - 18_874_368,
+                )?;
+                let mut gu_p = ws_big;
+                let mut act_p = ws_med;
+                self.cuda.launch(
+                    self.funcs.silu_mul_packed_2d,
+                    (36, seq_len as u32, 1),
+                    (256, 1, 1),
+                    &mut [
+                        &mut gu_p as *mut _ as *mut c_void,
+                        &mut act_p as *mut _ as *mut c_void,
+                        &mut inter as *mut _ as *mut c_void,
+                        &mut seq_i as *mut _ as *mut c_void,
+                    ],
+                )?;
+                run_prefill_gemm_i8(
+                    &self.cuda, &self.funcs.r10, self.funcs.residual_add,
+                    self.prefill_int8, seq_len, 2560, 9216, 512,
+                    ws_med, lyr.down, self.w_unpack_buf, ws.p_h, ws.p_del, true,
+                    ws.p_pool, 31_457_280, 0, 0,
+                )?;
+            }
         }
         Ok(())
     }
 
-    /// 512-Token Chunked Paged Prefill for 1 newly admitted request -> returns first_tok!
+    /// Phase R11 + R14: 1024-Token Super-Chunk Paged Prefill (BF12 + Smooth INT8) -> returns first_tok!
     pub fn prefill_one_paged(&self, prompt_ids: &[i64], slot_id: usize, blocks: &[i32]) -> Result<i64> {
         self.cuda.htod_async(self.d_pf_bt, blocks.as_ptr() as *const u8, blocks.len() * 4)?;
-        const CHUNK: usize = 512;
+        let chunk: usize = if self.prefill_int8 == PrefillInt8Mode::Smooth { 1024 } else { 512 };
         let mut cur_pos = 0usize;
         let mut last_seq_len = 0usize;
 
         while cur_pos < prompt_ids.len() {
-            let end = (cur_pos + CHUNK).min(prompt_ids.len());
+            let end = (cur_pos + chunk).min(prompt_ids.len());
             let seg = &prompt_ids[cur_pos..end];
             let seq_len = seg.len();
-            self.cuda.htod_async(self.p_ids, seg.as_ptr() as *const u8, seq_len * 8)?;
+            self.cuda.htod_async(self.pf_ws.p_ids, seg.as_ptr() as *const u8, seq_len * 8)?;
 
-            let mut ids_p = self.p_ids;
-            let mut emb_p = self.weights.embed_w;
-            let mut h_p = self.p_h;
-            let mut sl: i32 = seq_len as i32;
-            let mut dim: i32 = 2560;
-            self.cuda.launch(
-                self.funcs.embed_prefill,
-                (10, seq_len as u32, 1),
-                (256, 1, 1),
-                &mut [
-                    &mut ids_p as *mut _ as *mut c_void,
-                    &mut emb_p as *mut _ as *mut c_void,
-                    &mut h_p as *mut _ as *mut c_void,
-                    &mut sl as *mut _ as *mut c_void,
-                    &mut dim as *mut _ as *mut c_void,
-                ],
-            )?;
+            launch_embed_prefill_bf12(&self.cuda, &self.funcs.bf12, self.pf_ws.p_ids, self.weights.embed_w, self.pf_ws.p_h, seq_len)?;
             self.run_stage_paged_prefill(&self.weights.p1_layers, &self.p1_sub_idx, slot_id, cur_pos, seq_len)?;
             self.run_stage_paged_prefill(&self.weights.p2_layers, &self.p2_sub_idx, slot_id, cur_pos, seq_len)?;
             cur_pos = end;
             last_seq_len = seq_len;
         }
 
-        // Last token final RMSNorm -> lm_head -> argmax -> first_tok
-        let last_row = self.p_h + ((last_seq_len - 1) * 2560 * 2) as u64;
+        // Last token final RMSNorm -> BF12 Fused lm_head_argmax -> first_tok (ZERO d_logits!)
+        let last_row = self.pf_ws.p_h + ((last_seq_len - 1) * 2560 * 2) as u64;
         self.cuda.dtod_async(self.d_bridge, last_row, 2560 * 2)?;
         let mut br_p = self.d_bridge;
         let mut fnw = self.weights.final_norm_w;
@@ -777,35 +767,17 @@ impl BatchGpuEngine {
                 &mut eps as *mut _ as *mut c_void,
             ],
         )?;
-        self.cuda.gemm_bf16_nt(2, self.cfg.vocab_size, 2560, self.d_normed, self.weights.lm_head_w, self.d_logits)?;
-
-        let mut lg_p = self.d_logits;
-        let mut av_p = self.d_arg_vals;
-        let mut ai_p = self.d_arg_idxs;
-        let mut vocab_i: i32 = self.cfg.vocab_size as i32;
-        let mut nblk: i32 = 256;
-        let mut out_p = self.d_out_toks;
-        self.cuda.launch(
-            self.funcs.argmax_stage1,
-            (256, 1, 1),
-            (256, 1, 1),
-            &mut [
-                &mut lg_p as *mut _ as *mut c_void,
-                &mut av_p as *mut _ as *mut c_void,
-                &mut ai_p as *mut _ as *mut c_void,
-                &mut vocab_i as *mut _ as *mut c_void,
-            ],
-        )?;
-        self.cuda.launch(
+        launch_lm_head_bf12_argmax(
+            &self.cuda,
+            &self.funcs.bf12,
             self.funcs.argmax_stage2,
-            (1, 1, 1),
-            (256, 1, 1),
-            &mut [
-                &mut av_p as *mut _ as *mut c_void,
-                &mut ai_p as *mut _ as *mut c_void,
-                &mut out_p as *mut _ as *mut c_void,
-                &mut nblk as *mut _ as *mut c_void,
-            ],
+            self.funcs.argmax_batch_stage2,
+            1,
+            self.d_normed,
+            self.weights.lm_head_w,
+            self.d_arg_vals,
+            self.d_arg_idxs,
+            self.d_out_toks,
         )?;
         self.cuda.dtoh_async(self.h_out_toks as *mut u8, self.d_out_toks, 8)?;
         self.cuda.sync()?;
@@ -995,27 +967,11 @@ impl BatchGpuEngine {
     fn decode_batch_body(&self, b: usize) -> Result<()> {
         let mut dim: i32 = 2560;
         let mut eps: f32 = self.cfg.rms_norm_eps;
-        let mut b_i: i32 = b as i32;
         let mut total_h: i32 = (b * 2560) as i32;
-        let mut vocab_i: i32 = self.cfg.vocab_size as i32;
-        let mut nblk: i32 = 256;
 
         // PART 1 (Stage 0)
-        let mut tid_p = self.d_tok_ids;
-        let mut emb_p = self.weights.embed_w;
         let mut hid_p = self.d_hidden;
-        self.cuda.launch(
-            self.funcs.embed_prefill,
-            (10, b as u32, 1),
-            (256, 1, 1),
-            &mut [
-                &mut tid_p as *mut _ as *mut c_void,
-                &mut emb_p as *mut _ as *mut c_void,
-                &mut hid_p as *mut _ as *mut c_void,
-                &mut b_i as *mut _ as *mut c_void,
-                &mut dim as *mut _ as *mut c_void,
-            ],
-        )?;
+        launch_embed_prefill_bf12(&self.cuda, &self.funcs.bf12, self.d_tok_ids, self.weights.embed_w, self.d_hidden, b)?;
         self.run_stage_batch_decode(&self.weights.p1_layers, &self.p1_sub_idx, b, self.d_hidden)?;
 
         // ZERO-COPY GPU INTER-STAGE BRIDGE (Part 1 -> Part 2)
@@ -1049,33 +1005,18 @@ impl BatchGpuEngine {
                 &mut eps as *mut _ as *mut c_void,
             ],
         )?;
-        self.cuda.gemm_bf16_nt(b.max(2), self.cfg.vocab_size, 2560, self.d_normed, self.weights.lm_head_w, self.d_logits)?;
-
-        let mut lg_p = self.d_logits;
-        let mut av_p = self.d_arg_vals;
-        let mut ai_p = self.d_arg_idxs;
-        let mut out_p = self.d_out_toks;
-        self.cuda.launch(
-            self.funcs.argmax_batch_stage1,
-            (256, b as u32, 1),
-            (256, 1, 1),
-            &mut [
-                &mut lg_p as *mut _ as *mut c_void,
-                &mut av_p as *mut _ as *mut c_void,
-                &mut ai_p as *mut _ as *mut c_void,
-                &mut vocab_i as *mut _ as *mut c_void,
-            ],
-        )?;
-        self.cuda.launch(
+        // Phase R14: Fused Batched BF12 lm_head + Online Argmax for B=1..4 (ZERO d_logits, ZERO cuBLAS!)
+        launch_lm_head_bf12_argmax(
+            &self.cuda,
+            &self.funcs.bf12,
+            self.funcs.argmax_stage2,
             self.funcs.argmax_batch_stage2,
-            (1, b as u32, 1),
-            (256, 1, 1),
-            &mut [
-                &mut av_p as *mut _ as *mut c_void,
-                &mut ai_p as *mut _ as *mut c_void,
-                &mut out_p as *mut _ as *mut c_void,
-                &mut nblk as *mut _ as *mut c_void,
-            ],
+            b,
+            self.d_normed,
+            self.weights.lm_head_w,
+            self.d_arg_vals,
+            self.d_arg_idxs,
+            self.d_out_toks,
         )?;
         // Phase R9: Capture D2H directly inside decode_graphs[b-1] (0 extra host launch!)
         self.cuda.dtoh_async(self.h_out_toks as *mut u8, self.d_out_toks, b * 8)?;
@@ -1170,8 +1111,9 @@ impl BatchClient {
         max_seq: usize,
         max_batch: usize,
         force_max_seq: bool,
+        prefill_int8: PrefillInt8Mode,
     ) -> Result<Arc<Self>> {
-        let eng = BatchGpuEngine::load(model_dir, split_layer, max_seq, max_batch, force_max_seq)?;
+        let eng = BatchGpuEngine::load(model_dir, split_layer, max_seq, max_batch, force_max_seq, prefill_int8)?;
         let (free_b, total_b) = eng.cuda.mem_info().unwrap_or((0, 0));
         let tok = Arc::new(QwenTokenizer::load(model_dir, eng.cfg.eos_token_id)?);
         let init_status = BatchStatusSnapshot {

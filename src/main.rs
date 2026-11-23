@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::batch_engine::{BatchClient, BatchGpuEngine};
-use crate::engine::RustSplitEngine;
+use crate::engine::{PrefillInt8Mode, RustSplitEngine};
 use crate::tokenizer::ChatMsg;
 
 #[tokio::main]
@@ -30,6 +30,7 @@ async fn main() -> Result<()> {
     let mut prefix_cache_slots: usize = 8;
     let mut force_max_seq = false;
     let mut skinny_m4_wide = true;
+    let mut prefill_int8 = PrefillInt8Mode::Smooth;
     let mut test_only = false;
     let mut profile_nsys = false;
 
@@ -46,6 +47,15 @@ async fn main() -> Result<()> {
             "--prefix-cache-slots" => { i += 1; prefix_cache_slots = args[i].parse()?; }
             "--force-max-seq" => { force_max_seq = true; }
             "--no-skinny-m4-wide" => { skinny_m4_wide = false; }
+            "--prefill-int8" => {
+                i += 1;
+                prefill_int8 = match args[i].as_str() {
+                    "off" | "bf16" | "0" => PrefillInt8Mode::Off,
+                    "smooth" | "1" => PrefillInt8Mode::Smooth,
+                    "ozaki" | "2" => PrefillInt8Mode::Ozaki,
+                    other => anyhow::bail!("Unknown --prefill-int8 mode: {other} (use off|smooth|ozaki)"),
+                };
+            }
             "--test-only" => { test_only = true; }
             "--profile-nsys" => { profile_nsys = true; }
             _ => {}
@@ -58,8 +68,8 @@ async fn main() -> Result<()> {
         if profile_nsys {
             use std::thread::sleep;
             use std::time::Duration;
-            println!("[BatchEngine] Profiling Continuous Batching (B={max_batch}, max_seq={max_seq})...");
-            let mut beng = BatchGpuEngine::load(&model_dir, split_layer, max_seq, max_batch, force_max_seq)?;
+            println!("[BatchEngine] Profiling Continuous Batching (B={max_batch}, max_seq={max_seq}, prefill_int8={prefill_int8:?})...");
+            let mut beng = BatchGpuEngine::load(&model_dir, split_layer, max_seq, max_batch, force_max_seq, prefill_int8)?;
             let p_base = "Explain GPU inference serving architecture, continuous batching, paged KV cache, and Tensor Core GEMMs. ";
             let (mut ids128, _, _) = beng.tok.format_messages(&[ChatMsg { role: "user".into(), content: p_base.repeat(6) }])?;
             ids128.truncate(128);
@@ -83,8 +93,8 @@ async fn main() -> Result<()> {
             return Ok(());
         }
 
-        println!("[BatchEngine] Starting Continuous Batching + Paged KV Server (max_batch={max_batch}, max_seq={max_seq})...");
-        let client = BatchClient::start(&model_dir, split_layer, max_seq, max_batch, force_max_seq)?;
+        println!("[BatchEngine] Starting Continuous Batching + Paged KV Server (max_batch={max_batch}, max_seq={max_seq}, prefill_int8={prefill_int8:?})...");
+        let client = BatchClient::start(&model_dir, split_layer, max_seq, max_batch, force_max_seq, prefill_int8)?;
         {
             let s = client.status.lock().unwrap();
             println!(
@@ -109,8 +119,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    println!("[RustSplitServer] Loading Qwen3.5-4B (split_layer={split_layer}, max_seq={max_seq}, mtp_drafts={mtp_drafts}, prefix_cache_slots={prefix_cache_slots}, skinny_m4_wide={skinny_m4_wide})...");
-    let mut eng = RustSplitEngine::load(&model_dir, split_layer, max_seq, mtp_drafts, prefix_cache_slots, force_max_seq, skinny_m4_wide)?;
+    println!("[RustSplitServer] Loading Qwen3.5-4B (split_layer={split_layer}, max_seq={max_seq}, mtp_drafts={mtp_drafts}, prefix_cache_slots={prefix_cache_slots}, skinny_m4_wide={skinny_m4_wide}, prefill_int8={prefill_int8:?})...");
+    let mut eng = RustSplitEngine::load(&model_dir, split_layer, max_seq, mtp_drafts, prefix_cache_slots, force_max_seq, skinny_m4_wide, prefill_int8)?;
     let (free_b, total_b) = eng.cuda.mem_info()?;
     println!(
         "[RustSplitServer] Loaded in {:.2}s | Ctx={} | MTP K={} | PrefixSlots={} | VRAM alloc={:.1} MiB | free={:.1} MiB / {:.1} MiB",

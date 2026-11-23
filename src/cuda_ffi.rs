@@ -27,9 +27,12 @@ pub const CUBLAS_STATUS_SUCCESS: CublasStatus = 0;
 
 pub const CUBLAS_OP_N: c_int = 0;
 pub const CUBLAS_OP_T: c_int = 1;
+pub const CUDA_R_8I: c_int = 3;
+pub const CUDA_R_32I: c_int = 10;
 pub const CUDA_R_16BF: c_int = 14;
 pub const CUDA_R_32F: c_int = 0;
 pub const CUBLAS_COMPUTE_32F: c_int = 68;
+pub const CUBLAS_COMPUTE_32I: c_int = 72;
 pub const CUBLAS_COMPUTE_32F_FAST_TF32: c_int = 77;
 pub const CUBLAS_GEMM_DEFAULT_TENSOR_OP: c_int = 99;
 pub const CU_STREAM_NON_BLOCKING: c_uint = 1;
@@ -228,14 +231,22 @@ impl CudaRuntime {
             check_cublas(cublasCreate(&mut cublas), "cublasCreate")?;
             check_cublas(cublasSetStream(cublas, stream), "cublasSetStream")?;
 
-            let mut ptx_null = Vec::with_capacity(ptx_bytes.len() + 1);
-            ptx_null.extend_from_slice(ptx_bytes);
-            ptx_null.push(0);
             let mut module: CUmodule = ptr::null_mut();
-            check_cu(
-                cuModuleLoadData(&mut module, ptx_null.as_ptr() as *const c_void),
-                "cuModuleLoadData",
-            )?;
+            if ptx_bytes.starts_with(b"\x7fELF") {
+                // Native CUBIN (SASS): load directly with ZERO runtime PTX->SASS JIT compilation!
+                check_cu(
+                    cuModuleLoadData(&mut module, ptx_bytes.as_ptr() as *const c_void),
+                    "cuModuleLoadData(cubin)",
+                )?;
+            } else {
+                let mut ptx_null = Vec::with_capacity(ptx_bytes.len() + 1);
+                ptx_null.extend_from_slice(ptx_bytes);
+                ptx_null.push(0);
+                check_cu(
+                    cuModuleLoadData(&mut module, ptx_null.as_ptr() as *const c_void),
+                    "cuModuleLoadData(ptx)",
+                )?;
+            }
 
             Ok(Self {
                 _cuda_lib: cuda_lib,
@@ -439,6 +450,47 @@ impl CudaRuntime {
                     CUBLAS_GEMM_DEFAULT_TENSOR_OP,
                 ),
                 "cublasGemmEx",
+            )
+        }
+    }
+
+    /// Phase R10: Row-major C_i32[M, N] = A_i8[M, K] @ B_i8[N, K]^T on Ampere INT8 Tensor Cores (IMMA, ~175 TOPS!)
+    /// Requires M, N, K multiples of 4 and 16-byte aligned pointers.
+    pub fn gemm_i8_nt(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        a: CUdeviceptr,
+        b: CUdeviceptr,
+        c: CUdeviceptr,
+    ) -> Result<()> {
+        let alpha: i32 = 1;
+        let beta: i32 = 0;
+        unsafe {
+            check_cublas(
+                (self.cublasGemmEx)(
+                    self.cublas,
+                    CUBLAS_OP_T,
+                    CUBLAS_OP_N,
+                    n as c_int,
+                    m as c_int,
+                    k as c_int,
+                    &alpha as *const i32 as *const c_void,
+                    b as *const c_void,
+                    CUDA_R_8I,
+                    k as c_int,
+                    a as *const c_void,
+                    CUDA_R_8I,
+                    k as c_int,
+                    &beta as *const i32 as *const c_void,
+                    c as *mut c_void,
+                    CUDA_R_32I,
+                    n as c_int,
+                    CUBLAS_COMPUTE_32I,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+                ),
+                "cublasGemmEx(INT8)",
             )
         }
     }
